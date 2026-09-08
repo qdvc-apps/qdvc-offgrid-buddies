@@ -1013,42 +1013,66 @@ def _build_textual_app(cfg, llama_version, available):
     the tool runs without Textual installed."""
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Vertical, VerticalScroll
+    from textual.containers import (Center, Container, Horizontal, Middle,
+                                    Vertical, VerticalScroll)
     from textual.screen import Screen
     from textual.widgets import (Footer, Header, Input, Label, ListItem,
-                                 ListView, Static)
+                                 ListView, LoadingIndicator, Static)
 
     # ------- palette: warm companion (left) vs cool self (right) -------------
     # One load-bearing choice: the buddy speaks in warm amber from the left,
     # you speak in cool slate from the right. Everything else stays quiet.
+    #
+    # Alignment note: to push a bubble to the left or right we must set
+    # `align-horizontal` on the ROW container (which positions its child),
+    # not `content-align` (which only aligns a widget's own text). Bubbles use
+    # `height: auto` and wrap so long messages grow downward instead of being
+    # clipped.
     APP_CSS = """
     Screen { background: $surface; }
 
     /* Launch screen */
-    #launch-wrap { align: center middle; height: 1fr; }
-    #launch-title { content-align: center middle; height: 3; text-style: bold; }
-    #launch-hint { content-align: center middle; color: $text-muted; height: 2; }
-    ListView { width: 60; height: auto; max-height: 20; background: $surface;
-               border: round $primary; padding: 1 1; }
+    #launch-title { content-align: center middle; height: 3; text-style: bold;
+                    width: 1fr; }
+    #launch-hint { content-align: center middle; color: $text-muted; height: 2;
+                   width: 1fr; }
+    #launch-list { width: 60; height: auto; max-height: 20; background: $surface;
+                   border: round $primary; padding: 1 1; }
     ListItem { padding: 1 2; }
     ListItem > Label { width: 1fr; }
     ListItem.--highlight { background: $primary 25%; }
 
     /* Chat screen */
     #log { height: 1fr; padding: 1 2; }
-    .row-buddy { width: 1fr; content-align: left middle; padding: 0 0 1 0; }
-    .row-user  { width: 1fr; content-align: right middle; padding: 0 0 1 0; }
+
+    /* Rows span the full width; align-horizontal positions the bubble. */
+    .row-buddy { width: 1fr; height: auto; align-horizontal: left;
+                 padding: 0 0 1 0; }
+    .row-user  { width: 1fr; height: auto; align-horizontal: right;
+                 padding: 0 0 1 0; }
+
+    /* The stack holding a bubble (and, for the buddy, its speaker tag). It is
+       auto-width so it hugs the bubble, letting the row alignment place it. */
+    .stack-buddy { width: auto; max-width: 70%; height: auto; }
+    .stack-user  { width: auto; max-width: 70%; height: auto; }
+
     .bubble-buddy {
         background: #3a2f1e; color: #f4e6c8; padding: 1 2;
-        border: round #c8933b; width: auto; max-width: 70%;
+        border: round #c8933b; width: auto; height: auto;
     }
     .bubble-user {
         background: #1e2a33; color: #d6ecf5; padding: 1 2;
-        border: round #4a7fa0; width: auto; max-width: 70%;
+        border: round #4a7fa0; width: auto; height: auto;
     }
-    .speaker { color: $text-muted; padding: 0 1; }
+    .speaker { color: $text-muted; padding: 0 1; height: 1; }
+
     #composer { dock: bottom; height: 3; border: round $primary; }
     #status { dock: bottom; height: 1; color: $text-muted; padding: 0 2; }
+
+    /* Loading screen shown while a save-point restores. */
+    #loading-label { content-align: center middle; height: 3; width: 1fr;
+                     color: $text-muted; }
+    LoadingIndicator { width: auto; height: 1; color: $primary; }
     """
 
     class BuddyList(ListView):
@@ -1067,9 +1091,10 @@ def _build_textual_app(cfg, llama_version, available):
                     ListItem(Label(f"{buddy}\n[dim]{variants}[/dim]"),
                              id=f"buddy-{buddy}")
                 )
-            with Vertical(id="launch-wrap"):
+            with Middle():
                 yield Static("Choose who to talk with", id="launch-title")
-                yield BuddyList(*items)
+                with Center():
+                    yield BuddyList(*items, id="launch-list")
                 yield Static("\u2191\u2193 to move \u00b7 Enter to open "
                              "\u00b7 q to quit", id="launch-hint")
             yield Footer()
@@ -1094,6 +1119,8 @@ def _build_textual_app(cfg, llama_version, available):
         BINDINGS = [
             Binding("escape", "back", "Switch buddy"),
             Binding("ctrl+r", "reset", "Reset chat"),
+            Binding("pageup", "scroll_up", "Scroll up"),
+            Binding("pagedown", "scroll_down", "Scroll down"),
         ]
 
         def __init__(self, controller: ChatController):
@@ -1119,20 +1146,29 @@ def _build_textual_app(cfg, llama_version, available):
         def _set_status(self, text: str) -> None:
             self.query_one("#status", Static).update(text)
 
+        def _make_bubble(self, text: str, cls: str) -> Static:
+            """A Static that wraps and grows with content (no truncation)."""
+            bubble = Static(text, classes=cls)
+            # Ensure wrapping is on and the widget shrinks/grows to content.
+            bubble.styles.text_wrap = "wrap"
+            return bubble
+
         def _add_user_row(self, text: str) -> None:
             log = self.query_one("#log", VerticalScroll)
-            row = Static(text, classes="bubble-user")
-            wrap = Vertical(row, classes="row-user")
-            log.mount(wrap)
+            bubble = self._make_bubble(text, "bubble-user")
+            stack = Vertical(bubble, classes="stack-user")
+            row = Horizontal(stack, classes="row-user")
+            log.mount(row)
             log.scroll_end(animate=False)
 
         def _add_buddy_row(self) -> Static:
             """Create an empty buddy bubble to stream into; return the Static."""
             log = self.query_one("#log", VerticalScroll)
-            bubble = Static("", classes="bubble-buddy")
+            bubble = self._make_bubble("", "bubble-buddy")
             speaker = Label(self.controller.buddy, classes="speaker")
-            wrap = Vertical(speaker, bubble, classes="row-buddy")
-            log.mount(wrap)
+            stack = Vertical(speaker, bubble, classes="stack-buddy")
+            row = Horizontal(stack, classes="row-buddy")
+            log.mount(row)
             log.scroll_end(animate=False)
             return bubble
 
@@ -1154,6 +1190,12 @@ def _build_textual_app(cfg, llama_version, available):
             if self._streaming:
                 return
             self.app.pop_screen()
+
+        def action_scroll_up(self) -> None:
+            self.query_one("#log", VerticalScroll).scroll_page_up()
+
+        def action_scroll_down(self) -> None:
+            self.query_one("#log", VerticalScroll).scroll_page_down()
 
         def action_reset(self) -> None:
             if self._streaming:
@@ -1198,6 +1240,23 @@ def _build_textual_app(cfg, llama_version, available):
                              "\u00b7 Ctrl+R to reset")
             self.query_one("#composer", Input).focus()
 
+    class LoadingScreen(Screen):
+        """Shown while a save-point restores so the UI never looks frozen."""
+
+        def __init__(self, buddy, variant):
+            super().__init__()
+            self._buddy = buddy
+            self._variant = variant
+
+        def compose(self) -> ComposeResult:
+            yield Header(show_clock=False)
+            with Middle():
+                yield Static(f"Waking up {self._buddy}\u2026",
+                             id="loading-label")
+                with Center():
+                    yield LoadingIndicator()
+            yield Footer()
+
     class BuddiesApp(App):
         CSS = APP_CSS
         TITLE = "off-grid buddies"
@@ -1211,12 +1270,27 @@ def _build_textual_app(cfg, llama_version, available):
             )
             if not ok:
                 self.bell()
-                self.push_screen(LaunchScreen())
                 return
+            # Show the loading screen immediately, then restore the save-point
+            # on a worker thread so the UI stays responsive (spinner animates)
+            # instead of freezing during the multi-second load.
+            self.push_screen(LoadingScreen(buddy, variant))
             controller = ChatController(cfg, buddy, variant, side)
-            loaded, msg = controller.load()
+
+            def do_load():
+                loaded, msg = controller.load()
+                self.call_from_thread(self._after_load, loaded, msg,
+                                      controller)
+
+            self.run_worker(do_load, thread=True, exclusive=True)
+
+        def _after_load(self, loaded, msg, controller):
+            # Replace the loading screen with either the chat or the launch
+            # screen (on failure), so the loading screen never lingers.
+            self.pop_screen()  # remove LoadingScreen
             if not loaded:
                 self.bell()
+                self.notify(msg, severity="error", title="Could not load buddy")
                 return
             self.push_screen(ChatScreen(controller))
 
