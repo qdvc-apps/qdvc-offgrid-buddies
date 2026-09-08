@@ -62,10 +62,13 @@ Two thinking-mode variants can be built per buddy:
   move with the up/down arrows and press Enter to open one. The chat screen
   streams the buddy's reply as it generates. Your messages appear right-aligned
   in cool slate; the buddy's appear left-aligned in warm amber, so the two are
-  easy to tell apart at a glance. Scroll the conversation with Page Up / Page
-  Down. Press Esc to go back and switch buddy, Ctrl+R to reset the conversation
-  to the save-point, and q (on the launch screen) to quit. Opening a buddy
-  shows a brief loading indicator while its save-point restores.
+  easy to tell apart at a glance. Messages render Markdown (bold, italics,
+  lists, inline code) once complete: your message renders on send, the buddy's
+  once its reply finishes streaming. Scroll the conversation with Page Up /
+  Page Down. Press Esc to go back and switch buddy, Ctrl+R to reset the
+  conversation to the save-point, type /quit to leave, and press q (on the
+  launch screen) to quit. Opening a buddy shows a console of load steps
+  (validating, loading weights, restoring state) so any slow step is visible.
 
 ## Sizing notes
 

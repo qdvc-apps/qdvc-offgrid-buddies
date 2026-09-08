@@ -954,8 +954,12 @@ class ChatController:
         self.llm = None
         self.transcript = self.persona_prefix or ""
 
-    def load(self):
-        """Load the model and restore the save-point. Returns (ok, message)."""
+    def load(self, on_before_restore=None):
+        """Load the model and restore the save-point. Returns (ok, message).
+
+        on_before_restore, if given, is called after the model weights load but
+        just before the (single, blocking) state restore, so the UI can show
+        that step starting."""
         if not self.persona_prefix:
             return False, ("This save-point predates prefix tracking. "
                            "Re-run build.")
@@ -967,6 +971,11 @@ class ChatController:
             n_gpu_layers=0,
             verbose=False,
         )
+        if on_before_restore is not None:
+            try:
+                on_before_restore()
+            except Exception:
+                pass
         if not _load_state_into(self.llm, self.state_path):
             return False, "Failed to restore the save-point. Re-run build."
         return True, "ready"
@@ -1017,7 +1026,7 @@ def _build_textual_app(cfg, llama_version, available):
                                     Vertical, VerticalScroll)
     from textual.screen import Screen
     from textual.widgets import (Footer, Input, Label, ListItem,
-                                 ListView, LoadingIndicator, Static)
+                                 ListView, Markdown, Static)
 
     # ------- palette: warm companion (left) vs cool self (right) -------------
     # One load-bearing choice: the buddy speaks in warm amber from the left,
@@ -1045,23 +1054,29 @@ def _build_textual_app(cfg, llama_version, available):
     /* Chat screen */
     #chat-banner { height: 1; content-align: center middle; width: 1fr;
                    color: $primary; text-style: bold; }
-    #log { height: 1fr; padding: 1 2; }
 
-    /* Rows span the full width; align-horizontal positions the bubble. */
+    /* Gap between the scrolled content and the scrollbar, about one scrollbar
+       width, via right padding on the scroll container plus a matching
+       scrollbar size. */
+    #log { height: 1fr; padding: 1 2; scrollbar-size-vertical: 1;
+           scrollbar-gutter: stable; }
+
+    /* Rows span the full width; align-horizontal positions the bubble. A wide
+       max-width on the stack leaves only a slim central gutter (each side may
+       use up to ~86% of the row), instead of the previous 70% that left a
+       third of the screen empty down the middle. */
     .row-buddy { width: 1fr; height: auto; align-horizontal: left;
-                 padding: 0 0 1 0; }
+                 padding: 0 1 1 0; }
     .row-user  { width: 1fr; height: auto; align-horizontal: right;
-                 padding: 0 0 1 0; }
+                 padding: 0 0 1 1; }
 
-    /* The stack holds a bubble (and, for the buddy, a speaker tag) and hugs
-       the bubble's width, capped at 70% of the row. */
-    .stack-buddy { width: auto; max-width: 70%; height: auto; }
-    .stack-user  { width: auto; max-width: 70%; height: auto; }
+    .stack-buddy { width: auto; max-width: 86%; height: auto; }
+    .stack-user  { width: auto; max-width: 86%; height: auto; }
 
     /* Bubbles are auto-width (shrink=True on the widget) but floored with a
-       min-width so a long message wraps into a readable column instead of a
-       thin ribbon, and capped by the stack's 70% so it never spans the row.
-       text-wrap: wrap (the Static default) then grows the height. */
+       min-width so a short message keeps a bubble shape, and capped by the
+       stack so a long one wraps into a wide column with only a slim gutter
+       remaining. text-wrap: wrap (the Static default) grows the height. */
     .bubble-buddy {
         background: #3a2f1e; color: #f4e6c8; padding: 1 2;
         border: round #c8933b; width: auto; min-width: 32; height: auto;
@@ -1072,15 +1087,46 @@ def _build_textual_app(cfg, llama_version, available):
         border: round #4a7fa0; width: auto; min-width: 32; height: auto;
         text-wrap: wrap;
     }
+
+    /* Rendered-Markdown bubbles: same skin as the plain bubbles, but the
+       Markdown widget adds its own block margins we must zero out so the
+       bubble stays tight around the content. */
+    .md-buddy {
+        background: #3a2f1e; color: #f4e6c8; padding: 1 2;
+        border: round #c8933b; width: auto; min-width: 32; max-width: 100%;
+        height: auto;
+    }
+    .md-user {
+        background: #1e2a33; color: #d6ecf5; padding: 1 2;
+        border: round #4a7fa0; width: auto; min-width: 32; max-width: 100%;
+        height: auto;
+    }
+    .md-buddy Markdown, .md-user Markdown { background: transparent; margin: 0;
+                                            padding: 0; height: auto; }
+    .md-buddy MarkdownBlock, .md-user MarkdownBlock { margin: 0; padding: 0; }
+    .md-buddy MarkdownFence, .md-user MarkdownFence { margin: 1 0; }
+
     .speaker { color: $text-muted; padding: 0 1; height: 1; }
 
-    #composer { dock: bottom; height: 3; border: round $primary; }
-    #status { dock: bottom; height: 1; color: $text-muted; padding: 0 2; }
+    /* status + composer stacked in a bottom-docked wrapper. Height 4 = the
+       1-row status plus the composer's 3 rows (border-top, content,
+       border-bottom), so the composer's bottom border is never clipped. */
+    #composer-wrap { dock: bottom; height: 4; }
+    #composer { height: 3; border: round $primary; }
+    #status { height: 1; color: $text-muted; padding: 0 2; }
 
-    /* Loading screen shown while a save-point restores. */
-    #loading-label { content-align: center middle; height: 3; width: 1fr;
-                     color: $text-muted; }
-    LoadingIndicator { width: auto; height: 1; color: $primary; }
+    /* Loading screen shown while a save-point restores: a scrolling console
+       of real progress lines so a stall is visible at the offending step. */
+    #load-title { height: 1; content-align: center middle; width: 1fr;
+                  color: $primary; text-style: bold; }
+    #load-log { width: 72; height: auto; max-height: 16; border: round $primary;
+                padding: 1 2; background: $surface; }
+    .load-line { width: 1fr; height: auto; color: $text-muted; }
+    .load-line-active { width: 1fr; height: auto; color: $primary;
+                        text-style: bold; }
+    .load-line-done { width: 1fr; height: auto; color: $success; }
+    .load-line-error { width: 1fr; height: auto; color: $error;
+                       text-style: bold; }
     """
 
     class BuddyList(ListView):
@@ -1140,11 +1186,15 @@ def _build_textual_app(cfg, llama_version, available):
                 f"{self.controller.buddy}  \u00b7  {self.controller.variant}",
                 id="chat-banner")
             yield VerticalScroll(id="log")
-            yield Static("", id="status")
-            yield Input(
-                placeholder=(f"Message {self.controller.buddy}\u2026  "
-                             f"(/quit to leave)"),
-                id="composer")
+            # status + composer live in a bottom-docked container sized to hold
+            # both, so the composer keeps all four borders (a bare dued dock
+            # let the status line overlap the composer's bottom border).
+            with Vertical(id="composer-wrap"):
+                yield Static("", id="status")
+                yield Input(
+                    placeholder=(f"Message {self.controller.buddy}\u2026  "
+                                 f"(/quit to leave)"),
+                    id="composer")
             yield Footer()
 
         def on_mount(self) -> None:
@@ -1160,25 +1210,39 @@ def _build_textual_app(cfg, llama_version, available):
             self.query_one("#status", Static).update(text)
 
         def _make_bubble(self, text: str, cls: str) -> Static:
-            """A Static that wraps and grows with content (no truncation).
+            """A plain Static used DURING streaming (fast, no re-parse per
+            token). shrink=True lets it wrap against the width cap; markup=False
+            keeps text literal so stray brackets aren't parsed as Rich markup.
+            Once a message is complete it is swapped for a Markdown render."""
+            return Static(text, classes=cls, shrink=True, markup=False)
 
-            shrink=True lets the widget size below its content's optimal
-            (longest-line) width so text wraps against the width cap instead of
-            overflowing and being clipped. markup=False keeps user/model text
-            literal so stray brackets aren't parsed as Rich markup."""
-            bubble = Static(text, classes=cls, shrink=True, markup=False)
-            return bubble
+        def _render_markdown_into(self, stack, text, md_cls):
+            """Replace a stack's plain bubble with a rendered Markdown widget so
+            **bold**, _italics_, lists, code, etc. display formatted. Used for
+            the buddy message once streaming completes (the stack is already
+            mounted by then)."""
+            for child in list(stack.children):
+                if isinstance(child, Static) and (
+                        child.has_class("bubble-user")
+                        or child.has_class("bubble-buddy")):
+                    child.remove()
+            holder = Vertical(Markdown(text), classes=md_cls)
+            stack.mount(holder)
 
         def _add_user_row(self, text: str) -> None:
             log = self.query_one("#log", VerticalScroll)
-            bubble = self._make_bubble(text, "bubble-user")
-            stack = Vertical(bubble, classes="stack-user")
+            # User text is complete on send, so render Markdown immediately by
+            # composing the holder as a child of the stack up front (avoids
+            # mounting into a not-yet-mounted container).
+            holder = Vertical(Markdown(text), classes="md-user")
+            stack = Vertical(holder, classes="stack-user")
             row = Horizontal(stack, classes="row-user")
             log.mount(row)
             log.scroll_end(animate=False)
 
-        def _add_buddy_row(self) -> Static:
-            """Create an empty buddy bubble to stream into; return the Static."""
+        def _add_buddy_row(self):
+            """Create an empty buddy bubble to stream into; return (bubble,
+            stack) so the caller can swap in a Markdown render when done."""
             log = self.query_one("#log", VerticalScroll)
             bubble = self._make_bubble("", "bubble-buddy")
             speaker = Label(self.controller.buddy, classes="speaker")
@@ -1186,7 +1250,7 @@ def _build_textual_app(cfg, llama_version, available):
             row = Horizontal(stack, classes="row-buddy")
             log.mount(row)
             log.scroll_end(animate=False)
-            return bubble
+            return bubble, stack
 
         def on_input_submitted(self, event) -> None:
             if self._streaming:
@@ -1201,10 +1265,10 @@ def _build_textual_app(cfg, llama_version, available):
             composer = self.query_one("#composer", Input)
             composer.value = ""
             self._add_user_row(text)
-            bubble = self._add_buddy_row()
+            bubble, stack = self._add_buddy_row()
             self._streaming = True
             self._set_status(f"{self.controller.buddy} is thinking\u2026")
-            self._run_generation(text, bubble)
+            self._run_generation(text, bubble, stack)
 
         def action_back(self) -> None:
             if self._streaming:
@@ -1226,12 +1290,13 @@ def _build_textual_app(cfg, llama_version, available):
             self._set_status("Conversation reset to the save-point.")
 
         # -- streaming runs in a worker thread; UI updates via call_from_thread
-        def _run_generation(self, user_text: str, bubble) -> None:
+        def _run_generation(self, user_text: str, bubble, stack) -> None:
             from textual.worker import get_current_worker
 
             def work():
                 worker = get_current_worker()
                 acc = []
+                errored = False
                 try:
                     for piece in self.controller.stream_reply(user_text):
                         if worker.is_cancelled:
@@ -1245,11 +1310,17 @@ def _build_textual_app(cfg, llama_version, available):
                         self.app.call_from_thread(log.scroll_end,
                                                   animate=False)
                     final = self.controller.visible_reply("".join(acc))
-                    self.app.call_from_thread(bubble.update, final or "\u2026")
                 except Exception as e:
+                    errored = True
                     self.app.call_from_thread(
                         bubble.update, f"(generation error: {e})")
                 finally:
+                    if not errored:
+                        # Swap the plain streaming bubble for a rendered
+                        # Markdown view of the finished reply.
+                        self.app.call_from_thread(
+                            self._render_markdown_into, stack,
+                            final or "\u2026", "md-buddy")
                     self.app.call_from_thread(self._finish_stream)
 
             self.run_worker(work, thread=True, exclusive=True)
@@ -1267,14 +1338,46 @@ def _build_textual_app(cfg, llama_version, available):
             super().__init__()
             self._buddy = buddy
             self._variant = variant
+            self._active_line = None  # the Static for the in-progress step
 
         def compose(self) -> ComposeResult:
             with Middle():
-                yield Static(f"Waking up {self._buddy}\u2026",
-                             id="loading-label")
+                yield Static(f"Waking up {self._buddy}  \u00b7  {self._variant}",
+                             id="load-title")
                 with Center():
-                    yield LoadingIndicator()
+                    yield VerticalScroll(id="load-log")
             yield Footer()
+
+        def begin_step(self, text: str) -> None:
+            """Mark the previous step done and start a new active line, so a
+            stall is visible at whichever step stays highlighted."""
+            if self._active_line is not None:
+                self._active_line.remove_class("load-line-active")
+                self._active_line.add_class("load-line-done")
+                self._active_line.update(f"\u2713 {self._active_line._plain}")
+            log = self.query_one("#load-log", VerticalScroll)
+            line = Static(f"\u2026 {text}", classes="load-line-active")
+            line._plain = text  # remember the label for the done/err rewrite
+            log.mount(line)
+            log.scroll_end(animate=False)
+            self._active_line = line
+
+        def fail_step(self, text: str) -> None:
+            """Turn the active line into an error and add a detail line."""
+            if self._active_line is not None:
+                self._active_line.remove_class("load-line-active")
+                self._active_line.add_class("load-line-error")
+                self._active_line.update(f"\u2717 {self._active_line._plain}")
+            log = self.query_one("#load-log", VerticalScroll)
+            detail = Static(text, classes="load-line-error")
+            log.mount(detail)
+            log.scroll_end(animate=False)
+
+        def finish_ok(self) -> None:
+            if self._active_line is not None:
+                self._active_line.remove_class("load-line-active")
+                self._active_line.add_class("load-line-done")
+                self._active_line.update(f"\u2713 {self._active_line._plain}")
 
     class BuddiesApp(App):
         CSS = APP_CSS
@@ -1284,36 +1387,63 @@ def _build_textual_app(cfg, llama_version, available):
             self.push_screen(LaunchScreen())
 
         def open_chat(self, buddy, variant):
-            # Show the loading screen FIRST, before any disk work. Validation
+            # Show the loading console FIRST, before any disk work. Validation
             # fingerprints the (multi-GB) GGUF, which can take ~1s on a slow
-            # disk; doing it here on the UI thread previously delayed the
-            # spinner's appearance. Now validation AND restore both happen on
-            # the worker thread, so the spinner shows immediately.
-            self.push_screen(LoadingScreen(buddy, variant))
+            # disk; doing it on the UI thread before pushing the screen was the
+            # source of the earlier delay. Now the screen appears immediately
+            # and every step reports progress from the worker thread, so a
+            # stall is visible at the exact step that hangs.
+            loading = LoadingScreen(buddy, variant)
+            self.push_screen(loading)
+
+            def step(text):
+                self.call_from_thread(loading.begin_step, text)
 
             def do_load():
+                step("Validating save-point (checking model & prompt)\u2026")
                 ok, reason, side = validate_savepoint(
                     cfg, buddy, variant, llama_version
                 )
                 if not ok:
-                    self.call_from_thread(self._after_load, False, reason, None)
+                    self.call_from_thread(loading.fail_step,
+                                          f"Cannot use save-point: {reason}")
+                    self.call_from_thread(self._after_load, False, reason,
+                                          None, loading)
                     return
+                step("Loading model weights\u2026")
                 controller = ChatController(cfg, buddy, variant, side)
-                loaded, msg = controller.load()
-                self.call_from_thread(self._after_load, loaded, msg,
-                                      controller if loaded else None)
+                # controller.load() does the model load AND the state restore;
+                # report the restore as its own step via a callback.
+                def on_restore():
+                    self.call_from_thread(
+                        loading.begin_step, "Restoring conversation state\u2026")
+                loaded, msg = controller.load(on_before_restore=on_restore)
+                if not loaded:
+                    self.call_from_thread(loading.fail_step, msg)
+                    self.call_from_thread(self._after_load, False, msg, None,
+                                          loading)
+                    return
+                self.call_from_thread(loading.finish_ok)
+                self.call_from_thread(self._after_load, True, msg, controller,
+                                      loading)
 
             self.run_worker(do_load, thread=True, exclusive=True)
 
-        def _after_load(self, loaded, msg, controller):
-            # Replace the loading screen with either the chat or the launch
-            # screen (on failure), so the loading screen never lingers.
-            self.pop_screen()  # remove LoadingScreen
+        def _after_load(self, loaded, msg, controller, loading):
+            # Replace the loading console with the chat screen on success, or
+            # leave it briefly and pop back on failure with an error toast.
             if not loaded:
                 self.bell()
                 self.notify(msg, severity="error", title="Could not load buddy")
+                # Give the user a moment to read the console, then return.
+                self.set_timer(2.0, self._pop_if_loading)
                 return
+            self.pop_screen()  # remove LoadingScreen
             self.push_screen(ChatScreen(controller))
+
+        def _pop_if_loading(self):
+            if isinstance(self.screen, LoadingScreen):
+                self.pop_screen()
 
     return BuddiesApp()
 
