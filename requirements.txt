@@ -1,0 +1,15 @@
+# Core dependencies for qdvc-offgrid-buddies.
+#
+# IMPORTANT: pin llama-cpp-python to ONE version and use the SAME version on
+# every laptop. A save-point built with one version may not restore correctly
+# under another, because the serialized KV-cache state format is version-
+# sensitive. Replace <x.y.z> with the version you standardise on, e.g.:
+#     llama-cpp-python==0.3.2
+llama-cpp-python
+
+PyYAML>=6.0
+
+# Optional but recommended: enables the most accurate physical-core and RAM
+# detection in `benchmark` and thread auto-detection. Without it, the tool
+# falls back to /proc parsing and os.cpu_count() heuristics.
+psutil

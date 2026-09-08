@@ -1,0 +1,71 @@
+# qdvc-offgrid-buddies — sample configuration
+# ---------------------------------------------------------------------------
+# Copy this file to `config.yml` in the same folder, then edit the values.
+#     cp config-sample.yml config.yml
+#
+# Relative paths are resolved against the folder containing this config file.
+# ---------------------------------------------------------------------------
+
+# Path to the Gemma 4 E4B GGUF model file.
+# The save-point is tied to this EXACT file — if you swap or re-download the
+# model, you must re-run `build`. Pin the same file across all target laptops.
+gguf_path: ./gemma-4-E4B-it-UD-Q4_K_XL.gguf
+
+# The TARGET laptop's total RAM in gigabytes (not necessarily this machine's).
+# Used to cap n_ctx so the KV cache fits safely alongside the model.
+# Run `qdvc-offgrid-buddies.py benchmark` on a representative machine for a
+# recommended value.
+target_ram_gb: 16
+
+# Folder containing one subfolder per "buddy". Each subfolder holds markdown
+# files that are concatenated in alphabetical order to form that buddy's
+# context prompt (e.g. 01-intro.md, 02-voice.md, 03-knowledge.md).
+buddies_dir: ./buddies
+
+# Folder where the built save-points (.state) and their metadata (.json) go.
+savefiles_dir: ./savefiles
+
+# Which thinking-mode variants to build. At least ONE must be true, or `build`
+# will stop and tell you why. Each requested variant is built as its own
+# save-point: <buddy>_nothink.state and/or <buddy>_yesthink.state.
+#   nothink  = faster, livelier, more in-character (recommended for personas)
+#   yesthink = slower, more deliberate; better for reasoning-heavy buddies
+thinking:
+  nothink: true
+  yesthink: false
+
+# CPU threads for inference. 0 (or omit) = auto-detect physical cores.
+# Matters most during `chat`, where it affects every generated token.
+# Use `benchmark` to see the recommended value for a given machine.
+n_threads: 0
+
+# ---------------------------------------------------------------------------
+# Tunables — sensible defaults; adjust later as you learn your hardware.
+# ---------------------------------------------------------------------------
+tunables:
+  # Base conversational runway (tokens) reserved on top of the prompt, so the
+  # user gets many turns before hitting the context ceiling.
+  runway_tokens: 8192
+
+  # Because both variants of a buddy share one n_ctx (sized for the more
+  # demanding case), the yesthink variant's hidden reasoning gets extra runway
+  # via this multiplier. 1.75 = 75% more runway to absorb thinking tokens.
+  yesthink_runway_multiplier: 1.75
+
+  # Fraction of the target RAM reserved for the OS and everything else.
+  os_reserve_fraction: 0.25
+
+  # Of the RAM left after the OS reserve and the model weights, the fraction
+  # the KV cache may occupy. The rest is safety headroom.
+  kv_cache_fraction: 0.6
+
+  # Optional hard ceiling on n_ctx regardless of RAM. 0 = no ceiling.
+  # Set this if you want to keep generation snappy on an older CPU by
+  # preventing very large contexts even when RAM would allow them.
+  max_n_ctx: 0
+
+  # Round n_ctx up to a multiple of this value for tidy allocation.
+  n_ctx_round_to: 512
+
+  # Never build a save-point smaller than this total context.
+  min_n_ctx: 2048

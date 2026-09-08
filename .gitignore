@@ -1,0 +1,12 @@
+# Local config (copied from config-sample.yml) — do not commit secrets/paths.
+config.yml
+
+# Built artefacts.
+savefiles/*.state
+savefiles/*.json
+
+# Models are large; keep them out of the repo.
+*.gguf
+
+__pycache__/
+*.pyc
