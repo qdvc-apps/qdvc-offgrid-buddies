@@ -1027,7 +1027,7 @@ def _build_textual_app(cfg, llama_version, available):
                                     Vertical, VerticalScroll)
     from textual.screen import Screen
     from textual.widgets import (Footer, Label, ListItem,
-                                 ListView, Markdown, Static, TextArea)
+                                 ListView, Static, TextArea)
 
     # ------- palette: warm companion (left) vs cool self (right) -------------
     # One load-bearing choice: the buddy speaks in warm amber from the left,
@@ -1089,31 +1089,11 @@ def _build_textual_app(cfg, llama_version, available):
         text-wrap: wrap;
     }
 
-    /* Rendered-Markdown bubbles: same skin as the plain bubbles, but the
-       Markdown widget adds its own block margins we must zero out so the
-       bubble stays tight around the content. */
-    .md-buddy {
-        background: #3a2f1e; color: #f4e6c8; padding: 1 2;
-        border: round #c8933b; width: auto; min-width: 32; max-width: 100%;
-        height: auto;
-    }
-    .md-user {
-        background: #1e2a33; color: #d6ecf5; padding: 1 2;
-        border: round #4a7fa0; width: auto; min-width: 32; max-width: 100%;
-        height: auto;
-    }
-    .md-buddy Markdown, .md-user Markdown { background: transparent; margin: 0;
-                                            padding: 0; height: auto; }
-    .md-buddy MarkdownBlock, .md-user MarkdownBlock { margin: 0; padding: 0; }
-    .md-buddy MarkdownFence, .md-user MarkdownFence { margin: 1 0; }
-
     .speaker { color: $text-muted; padding: 0 1; height: 1; }
 
-    /* status + composer stacked in a bottom-docked wrapper. Height auto so the
-       wrapper grows with the TextArea. The composer is a TextArea that grows
-       from 1 line up to a cap as typed text wraps; its border draws on all
-       four sides because the wrapper reserves height for it (nothing docks
-       over its bottom edge). */
+    /* composer (top) above the status line (bottom) in a bottom-docked
+       wrapper. The status row sits beneath the composer so its bottom border
+       always has a clear line under it. */
     #composer-wrap { dock: bottom; height: auto; }
     #composer { height: auto; max-height: 8; min-height: 3;
                 border: round $primary; padding: 0 1; }
@@ -1211,18 +1191,18 @@ def _build_textual_app(cfg, llama_version, available):
                 f"{self.controller.buddy}  \u00b7  {self.controller.variant}",
                 id="chat-banner")
             yield VerticalScroll(id="log")
-            # status + composer live in a bottom-docked wrapper whose height is
-            # auto, so it grows as the TextArea grows and always leaves room for
-            # the composer's bottom border.
+            # The composer sits above the status line inside the wrapper. With
+            # the status row beneath it, the composer's bottom border always has
+            # a clear line under it (fixes the border appearing clipped when it
+            # sat flush against the footer).
             with Vertical(id="composer-wrap"):
-                yield Static("", id="status")
                 composer = ChatInput(
                     id="composer", soft_wrap=True, compact=True,
                     placeholder=(f"Message {self.controller.buddy}\u2026  "
                                  f"(Enter to send \u00b7 /quit to leave)"),
                 )
                 yield composer
-            yield Footer()
+                yield Static("", id="status")
 
         def on_mount(self) -> None:
             # We intentionally do NOT set self.title/sub_title here: updating
@@ -1237,52 +1217,22 @@ def _build_textual_app(cfg, llama_version, available):
             self.query_one("#status", Static).update(text)
 
         def _make_bubble(self, text: str, cls: str) -> Static:
-            """A plain Static used DURING streaming (fast, no re-parse per
-            token). shrink=True lets it wrap against the width cap; markup=False
-            keeps text literal so stray brackets aren't parsed as Rich markup.
-            Once a message is complete it is swapped for a Markdown render."""
+            """A plain Static bubble that wraps and grows with content.
+            shrink=True lets it wrap against the width cap; markup=False keeps
+            user/model text literal so stray brackets aren't parsed as Rich
+            markup."""
             return Static(text, classes=cls, shrink=True, markup=False)
-
-        def _render_markdown_into(self, stack, text, md_cls):
-            """Replace a stack's plain streaming bubble with a rendered Markdown
-            widget. If text is empty, keep the existing plain bubble rather than
-            wiping it (defends against ever showing an empty/"..." message)."""
-            if not text or not text.strip():
-                return
-            # Find the plain streaming bubble, if still present.
-            plain = None
-            for child in list(stack.children):
-                if isinstance(child, Static) and (
-                        child.has_class("bubble-user")
-                        or child.has_class("bubble-buddy")):
-                    plain = child
-                    break
-            try:
-                holder = Vertical(Markdown(text), classes=md_cls)
-                stack.mount(holder)
-            except Exception:
-                # If the swap fails for any reason, fall back to showing the
-                # text in the existing plain bubble so nothing is lost.
-                if plain is not None:
-                    plain.update(text)
-                return
-            if plain is not None:
-                plain.remove()
 
         def _add_user_row(self, text: str) -> None:
             log = self.query_one("#log", VerticalScroll)
-            # User text is complete on send, so render Markdown immediately by
-            # composing the holder as a child of the stack up front (avoids
-            # mounting into a not-yet-mounted container).
-            holder = Vertical(Markdown(text), classes="md-user")
-            stack = Vertical(holder, classes="stack-user")
+            bubble = self._make_bubble(text, "bubble-user")
+            stack = Vertical(bubble, classes="stack-user")
             row = Horizontal(stack, classes="row-user")
             log.mount(row)
             log.scroll_end(animate=False)
 
-        def _add_buddy_row(self):
-            """Create an empty buddy bubble to stream into; return (bubble,
-            stack) so the caller can swap in a Markdown render when done."""
+        def _add_buddy_row(self) -> Static:
+            """Create an empty buddy bubble to stream into; return the Static."""
             log = self.query_one("#log", VerticalScroll)
             bubble = self._make_bubble("", "bubble-buddy")
             speaker = Label(self.controller.buddy, classes="speaker")
@@ -1290,7 +1240,7 @@ def _build_textual_app(cfg, llama_version, available):
             row = Horizontal(stack, classes="row-buddy")
             log.mount(row)
             log.scroll_end(animate=False)
-            return bubble, stack
+            return bubble
 
         def on_chat_input_submitted(self, event) -> None:
             if self._streaming:
@@ -1305,10 +1255,10 @@ def _build_textual_app(cfg, llama_version, available):
             composer = self.query_one("#composer", ChatInput)
             composer.text = ""
             self._add_user_row(text)
-            bubble, stack = self._add_buddy_row()
+            bubble = self._add_buddy_row()
             self._streaming = True
             self._set_status(f"{self.controller.buddy} is thinking\u2026")
-            self._run_generation(text, bubble, stack)
+            self._run_generation(text, bubble)
 
         def action_back(self) -> None:
             if self._streaming:
@@ -1330,14 +1280,12 @@ def _build_textual_app(cfg, llama_version, available):
             self._set_status("Conversation reset to the save-point.")
 
         # -- streaming runs in a worker thread; UI updates via call_from_thread
-        def _run_generation(self, user_text: str, bubble, stack) -> None:
+        def _run_generation(self, user_text: str, bubble) -> None:
             from textual.worker import get_current_worker
 
             def work():
                 worker = get_current_worker()
                 acc = []
-                final = ""          # always bound, even if the loop yields nothing
-                errored = False
                 try:
                     for piece in self.controller.stream_reply(user_text):
                         if worker.is_cancelled:
@@ -1350,23 +1298,16 @@ def _build_textual_app(cfg, llama_version, available):
                         log = self.query_one("#log", VerticalScroll)
                         self.app.call_from_thread(log.scroll_end,
                                                   animate=False)
+                    # Final tidy: strip trailing whitespace but keep the text
+                    # exactly as streamed. No widget swap, so nothing can wipe
+                    # a good reply.
                     final = self.controller.visible_reply("".join(acc))
+                    if final:
+                        self.app.call_from_thread(bubble.update, final)
                 except Exception as e:
-                    errored = True
                     self.app.call_from_thread(
                         bubble.update, f"(generation error: {e})")
                 finally:
-                    if not errored:
-                        # Swap the plain streaming bubble for a rendered
-                        # Markdown view. Fall back to the raw accumulated text
-                        # if visible_reply came back empty, and only to an
-                        # ellipsis if there was genuinely nothing at all — so a
-                        # real reply is never replaced by "...".
-                        text = final or "".join(acc).strip()
-                        if not text:
-                            text = "\u2026"
-                        self.app.call_from_thread(
-                            self._render_markdown_into, stack, text, "md-buddy")
                     self.app.call_from_thread(self._finish_stream)
 
             self.run_worker(work, thread=True, exclusive=True)
