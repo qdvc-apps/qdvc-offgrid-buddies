@@ -1016,7 +1016,7 @@ def _build_textual_app(cfg, llama_version, available):
     from textual.containers import (Center, Container, Horizontal, Middle,
                                     Vertical, VerticalScroll)
     from textual.screen import Screen
-    from textual.widgets import (Footer, Header, Input, Label, ListItem,
+    from textual.widgets import (Footer, Input, Label, ListItem,
                                  ListView, LoadingIndicator, Static)
 
     # ------- palette: warm companion (left) vs cool self (right) -------------
@@ -1043,6 +1043,8 @@ def _build_textual_app(cfg, llama_version, available):
     ListItem.--highlight { background: $primary 25%; }
 
     /* Chat screen */
+    #chat-banner { height: 1; content-align: center middle; width: 1fr;
+                   color: $primary; text-style: bold; }
     #log { height: 1fr; padding: 1 2; }
 
     /* Rows span the full width; align-horizontal positions the bubble. */
@@ -1051,18 +1053,24 @@ def _build_textual_app(cfg, llama_version, available):
     .row-user  { width: 1fr; height: auto; align-horizontal: right;
                  padding: 0 0 1 0; }
 
-    /* The stack holding a bubble (and, for the buddy, its speaker tag). It is
-       auto-width so it hugs the bubble, letting the row alignment place it. */
+    /* The stack holds a bubble (and, for the buddy, a speaker tag) and hugs
+       the bubble's width, capped at 70% of the row. */
     .stack-buddy { width: auto; max-width: 70%; height: auto; }
     .stack-user  { width: auto; max-width: 70%; height: auto; }
 
+    /* Bubbles are auto-width (shrink=True on the widget) but floored with a
+       min-width so a long message wraps into a readable column instead of a
+       thin ribbon, and capped by the stack's 70% so it never spans the row.
+       text-wrap: wrap (the Static default) then grows the height. */
     .bubble-buddy {
         background: #3a2f1e; color: #f4e6c8; padding: 1 2;
-        border: round #c8933b; width: auto; height: auto;
+        border: round #c8933b; width: auto; min-width: 32; height: auto;
+        text-wrap: wrap;
     }
     .bubble-user {
         background: #1e2a33; color: #d6ecf5; padding: 1 2;
-        border: round #4a7fa0; width: auto; height: auto;
+        border: round #4a7fa0; width: auto; min-width: 32; height: auto;
+        text-wrap: wrap;
     }
     .speaker { color: $text-muted; padding: 0 1; height: 1; }
 
@@ -1083,7 +1091,6 @@ def _build_textual_app(cfg, llama_version, available):
         BINDINGS = [Binding("q", "quit_app", "Quit")]
 
         def compose(self) -> ComposeResult:
-            yield Header(show_clock=False)
             items = []
             for buddy, ready in available:
                 variants = ", ".join(ready)
@@ -1129,16 +1136,22 @@ def _build_textual_app(cfg, llama_version, available):
             self._streaming = False
 
         def compose(self) -> ComposeResult:
-            yield Header(show_clock=False)
+            yield Static(
+                f"{self.controller.buddy}  \u00b7  {self.controller.variant}",
+                id="chat-banner")
             yield VerticalScroll(id="log")
             yield Static("", id="status")
-            yield Input(placeholder=f"Message {self.controller.buddy}\u2026",
-                        id="composer")
+            yield Input(
+                placeholder=(f"Message {self.controller.buddy}\u2026  "
+                             f"(/quit to leave)"),
+                id="composer")
             yield Footer()
 
         def on_mount(self) -> None:
-            self.title = self.controller.buddy
-            self.sub_title = self.controller.variant
+            # We intentionally do NOT set self.title/sub_title here: updating
+            # the Header's title during a fast screen swap can race the
+            # Header's own child mount. The buddy name is shown in our own
+            # #chat-banner widget, which we fully control.
             self.query_one("#composer", Input).focus()
             self._set_status("Ready. Enter to send \u00b7 Esc to switch buddy "
                              "\u00b7 Ctrl+R to reset")
@@ -1147,10 +1160,13 @@ def _build_textual_app(cfg, llama_version, available):
             self.query_one("#status", Static).update(text)
 
         def _make_bubble(self, text: str, cls: str) -> Static:
-            """A Static that wraps and grows with content (no truncation)."""
-            bubble = Static(text, classes=cls)
-            # Ensure wrapping is on and the widget shrinks/grows to content.
-            bubble.styles.text_wrap = "wrap"
+            """A Static that wraps and grows with content (no truncation).
+
+            shrink=True lets the widget size below its content's optimal
+            (longest-line) width so text wraps against the width cap instead of
+            overflowing and being clipped. markup=False keeps user/model text
+            literal so stray brackets aren't parsed as Rich markup."""
+            bubble = Static(text, classes=cls, shrink=True, markup=False)
             return bubble
 
         def _add_user_row(self, text: str) -> None:
@@ -1177,6 +1193,10 @@ def _build_textual_app(cfg, llama_version, available):
                 return
             text = event.value.strip()
             if not text:
+                return
+            # Typed commands.
+            if text.lower() in ("/quit", "/exit"):
+                self.app.exit()
                 return
             composer = self.query_one("#composer", Input)
             composer.value = ""
@@ -1228,7 +1248,7 @@ def _build_textual_app(cfg, llama_version, available):
                     self.app.call_from_thread(bubble.update, final or "\u2026")
                 except Exception as e:
                     self.app.call_from_thread(
-                        bubble.update, f"[i](generation error: {e})[/i]")
+                        bubble.update, f"(generation error: {e})")
                 finally:
                     self.app.call_from_thread(self._finish_stream)
 
@@ -1249,7 +1269,6 @@ def _build_textual_app(cfg, llama_version, available):
             self._variant = variant
 
         def compose(self) -> ComposeResult:
-            yield Header(show_clock=False)
             with Middle():
                 yield Static(f"Waking up {self._buddy}\u2026",
                              id="loading-label")
@@ -1265,22 +1284,24 @@ def _build_textual_app(cfg, llama_version, available):
             self.push_screen(LaunchScreen())
 
         def open_chat(self, buddy, variant):
-            ok, reason, side = validate_savepoint(
-                cfg, buddy, variant, llama_version
-            )
-            if not ok:
-                self.bell()
-                return
-            # Show the loading screen immediately, then restore the save-point
-            # on a worker thread so the UI stays responsive (spinner animates)
-            # instead of freezing during the multi-second load.
+            # Show the loading screen FIRST, before any disk work. Validation
+            # fingerprints the (multi-GB) GGUF, which can take ~1s on a slow
+            # disk; doing it here on the UI thread previously delayed the
+            # spinner's appearance. Now validation AND restore both happen on
+            # the worker thread, so the spinner shows immediately.
             self.push_screen(LoadingScreen(buddy, variant))
-            controller = ChatController(cfg, buddy, variant, side)
 
             def do_load():
+                ok, reason, side = validate_savepoint(
+                    cfg, buddy, variant, llama_version
+                )
+                if not ok:
+                    self.call_from_thread(self._after_load, False, reason, None)
+                    return
+                controller = ChatController(cfg, buddy, variant, side)
                 loaded, msg = controller.load()
                 self.call_from_thread(self._after_load, loaded, msg,
-                                      controller)
+                                      controller if loaded else None)
 
             self.run_worker(do_load, thread=True, exclusive=True)
 
