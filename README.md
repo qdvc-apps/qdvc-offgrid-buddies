@@ -98,6 +98,25 @@ If the self-check fails:
 - If it still fails, the remaining suspect is Gemma 4's hybrid/sliding-window
   attention interacting with state save/restore in your specific build.
 
+## Expected startup log messages
+
+On load you may see two llama.cpp messages. Both are expected and benign for
+this tool:
+
+- `using full-size SWA cache` — Gemma 4 uses sliding-window attention, and
+  llama.cpp is choosing to keep the full history rather than prune it. This is
+  exactly what the save-point / prefix-reuse design needs, so it is correct
+  behaviour here, not an error.
+- `padding V cache to 1024` (V embeddings differ across layers, FA not enabled)
+  — a consequence of Gemma 4's mixed attention when Flash Attention is off.
+  The tool deliberately keeps Flash Attention off, because enabling it with
+  Gemma 4's SWA + saved cache state is a known crash combination. The only
+  cost is a little extra V-cache memory, which the RAM budgeting accounts for.
+
+A third message, the duplicate-leading-`<bos>` warning, was a real issue and
+is fixed: rendered prompts no longer embed a literal BOS, so exactly one BOS is
+added (by the tokenizer at build, by the completion call at chat).
+
 ## Save-point validity
 
 A save-point is invalidated (and `chat` will refuse it, pointing you back to

@@ -463,12 +463,13 @@ def system_message_for(variant, base_system=None, canary=None):
     return sys_text
 
 
-# The Gemma 4 chat turn structure. llama-cpp-python's create_chat_completion
-# applies a template internally, but for the save-point to work we must control
-# the exact tokens ourselves and drive eval() at the low level. We therefore
-# render turns using Gemma's documented control tokens. If a future template
-# revision changes these, update here in one place.
-GEMMA_BOS = "<bos>"
+# The Gemma 4 chat turn structure. We render turns using Gemma's documented
+# control tokens and drive generation ourselves so the save-point works.
+#
+# IMPORTANT: we do NOT put a literal <bos> in these rendered strings. The BOS
+# token is added exactly once by the tokenizer (add_bos=True at build) and by
+# create_completion (which prepends its own BOS at chat time). Hardcoding a
+# <bos> here as well produced a duplicate-BOS warning and degraded quality.
 GEMMA_START = "<start_of_turn>"
 GEMMA_END = "<end_of_turn>"
 
@@ -476,14 +477,14 @@ GEMMA_END = "<end_of_turn>"
 def render_persona_prefix(system_text):
     """Render the fixed persona prefix (everything that gets saved into the
     KV cache) as a single string, ready to be tokenized. We fold the system
-    persona into the first user turn's lead-in, which Gemma handles well, and
-    stop right before the model's first generation so the cache ends at a
-    clean turn boundary.
+    persona into the first user turn, and stop right before the model's first
+    generation so the cache ends at a clean turn boundary.
+
+    No leading <bos>: it is supplied once by the tokenizer at build time and by
+    create_completion at chat time.
     """
-    # A single opening 'user' turn carrying the persona, followed by the model
-    # turn opener so the cache is positioned for the model to speak next.
     return (
-        f"{GEMMA_BOS}{GEMMA_START}user\n"
+        f"{GEMMA_START}user\n"
         f"{system_text}{GEMMA_END}\n"
         f"{GEMMA_START}model\n"
     )
@@ -525,11 +526,16 @@ def strip_thinking(text):
 # Low-level generation that CONTINUES the current KV cache
 # --------------------------------------------------------------------------- #
 
-def eval_text(llm, text, add_bos=False):
+def eval_text(llm, text, add_bos=True):
     """Tokenize `text` and eval it into the model, extending the current KV
     cache. Returns the tokens evaluated. Used at BUILD time to place the
-    persona into the cache before saving. `add_bos` is False because our
-    rendered strings already include <bos> where needed."""
+    persona into the cache before saving.
+
+    `add_bos=True` here inserts exactly ONE BOS token at the very start of the
+    persona prefix. The rendered strings no longer contain a literal <bos>, so
+    this is the single, canonical BOS the cache begins with — matching the BOS
+    that create_completion later prepends at chat time.
+    """
     tokens = llm.tokenize(text.encode("utf-8"), add_bos=add_bos, special=True)
     if tokens:
         llm.eval(tokens)
@@ -685,7 +691,7 @@ def _build_one(cfg, buddy, variant, prompt_text, files_used, n_ctx,
     # persona, and chat can continue from exactly this point.
     try:
         llm.reset()
-        persona_token_ids = eval_text(llm, prefix, add_bos=False)
+        persona_token_ids = eval_text(llm, prefix, add_bos=True)
     except Exception as e:
         sys.stderr.write(f"    ! Failed to evaluate persona prompt: {e}\n")
         del llm
