@@ -1022,11 +1022,12 @@ def _build_textual_app(cfg, llama_version, available):
     the tool runs without Textual installed."""
     from textual.app import App, ComposeResult
     from textual.binding import Binding
+    from textual.message import Message
     from textual.containers import (Center, Container, Horizontal, Middle,
                                     Vertical, VerticalScroll)
     from textual.screen import Screen
-    from textual.widgets import (Footer, Input, Label, ListItem,
-                                 ListView, Markdown, Static)
+    from textual.widgets import (Footer, Label, ListItem,
+                                 ListView, Markdown, Static, TextArea)
 
     # ------- palette: warm companion (left) vs cool self (right) -------------
     # One load-bearing choice: the buddy speaks in warm amber from the left,
@@ -1108,11 +1109,15 @@ def _build_textual_app(cfg, llama_version, available):
 
     .speaker { color: $text-muted; padding: 0 1; height: 1; }
 
-    /* status + composer stacked in a bottom-docked wrapper. Height 4 = the
-       1-row status plus the composer's 3 rows (border-top, content,
-       border-bottom), so the composer's bottom border is never clipped. */
-    #composer-wrap { dock: bottom; height: 4; }
-    #composer { height: 3; border: round $primary; }
+    /* status + composer stacked in a bottom-docked wrapper. Height auto so the
+       wrapper grows with the TextArea. The composer is a TextArea that grows
+       from 1 line up to a cap as typed text wraps; its border draws on all
+       four sides because the wrapper reserves height for it (nothing docks
+       over its bottom edge). */
+    #composer-wrap { dock: bottom; height: auto; }
+    #composer { height: auto; max-height: 8; min-height: 3;
+                border: round $primary; padding: 0 1; }
+    #composer:focus { border: round $accent; }
     #status { height: 1; color: $text-muted; padding: 0 2; }
 
     /* Loading screen shown while a save-point restores: a scrolling console
@@ -1168,6 +1173,26 @@ def _build_textual_app(cfg, llama_version, available):
         def action_quit_app(self) -> None:
             self.app.exit()
 
+    class ChatInput(TextArea):
+        """Multi-line composer that grows as text wraps. Enter sends the
+        message; the box auto-grows in height as a long line wraps. (Shift+Enter
+        would insert a newline where the terminal distinguishes it from Enter,
+        but many terminals don't, so we don't rely on or advertise it.)"""
+
+        class Submitted(Message):
+            def __init__(self, value: str):
+                super().__init__()
+                self.value = value
+
+        def _on_key(self, event) -> None:
+            # Enter submits. Some terminals report shift+enter as a distinct
+            # key; when they do, we let it fall through so TextArea inserts a
+            # newline. Plain enter always sends.
+            if event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                self.post_message(self.Submitted(self.text))
+
     class ChatScreen(Screen):
         BINDINGS = [
             Binding("escape", "back", "Switch buddy"),
@@ -1186,15 +1211,17 @@ def _build_textual_app(cfg, llama_version, available):
                 f"{self.controller.buddy}  \u00b7  {self.controller.variant}",
                 id="chat-banner")
             yield VerticalScroll(id="log")
-            # status + composer live in a bottom-docked container sized to hold
-            # both, so the composer keeps all four borders (a bare dued dock
-            # let the status line overlap the composer's bottom border).
+            # status + composer live in a bottom-docked wrapper whose height is
+            # auto, so it grows as the TextArea grows and always leaves room for
+            # the composer's bottom border.
             with Vertical(id="composer-wrap"):
                 yield Static("", id="status")
-                yield Input(
+                composer = ChatInput(
+                    id="composer", soft_wrap=True, compact=True,
                     placeholder=(f"Message {self.controller.buddy}\u2026  "
-                                 f"(/quit to leave)"),
-                    id="composer")
+                                 f"(Enter to send \u00b7 /quit to leave)"),
+                )
+                yield composer
             yield Footer()
 
         def on_mount(self) -> None:
@@ -1202,7 +1229,7 @@ def _build_textual_app(cfg, llama_version, available):
             # the Header's title during a fast screen swap can race the
             # Header's own child mount. The buddy name is shown in our own
             # #chat-banner widget, which we fully control.
-            self.query_one("#composer", Input).focus()
+            self.query_one("#composer", ChatInput).focus()
             self._set_status("Ready. Enter to send \u00b7 Esc to switch buddy "
                              "\u00b7 Ctrl+R to reset")
 
@@ -1217,17 +1244,30 @@ def _build_textual_app(cfg, llama_version, available):
             return Static(text, classes=cls, shrink=True, markup=False)
 
         def _render_markdown_into(self, stack, text, md_cls):
-            """Replace a stack's plain bubble with a rendered Markdown widget so
-            **bold**, _italics_, lists, code, etc. display formatted. Used for
-            the buddy message once streaming completes (the stack is already
-            mounted by then)."""
+            """Replace a stack's plain streaming bubble with a rendered Markdown
+            widget. If text is empty, keep the existing plain bubble rather than
+            wiping it (defends against ever showing an empty/"..." message)."""
+            if not text or not text.strip():
+                return
+            # Find the plain streaming bubble, if still present.
+            plain = None
             for child in list(stack.children):
                 if isinstance(child, Static) and (
                         child.has_class("bubble-user")
                         or child.has_class("bubble-buddy")):
-                    child.remove()
-            holder = Vertical(Markdown(text), classes=md_cls)
-            stack.mount(holder)
+                    plain = child
+                    break
+            try:
+                holder = Vertical(Markdown(text), classes=md_cls)
+                stack.mount(holder)
+            except Exception:
+                # If the swap fails for any reason, fall back to showing the
+                # text in the existing plain bubble so nothing is lost.
+                if plain is not None:
+                    plain.update(text)
+                return
+            if plain is not None:
+                plain.remove()
 
         def _add_user_row(self, text: str) -> None:
             log = self.query_one("#log", VerticalScroll)
@@ -1252,7 +1292,7 @@ def _build_textual_app(cfg, llama_version, available):
             log.scroll_end(animate=False)
             return bubble, stack
 
-        def on_input_submitted(self, event) -> None:
+        def on_chat_input_submitted(self, event) -> None:
             if self._streaming:
                 return
             text = event.value.strip()
@@ -1262,8 +1302,8 @@ def _build_textual_app(cfg, llama_version, available):
             if text.lower() in ("/quit", "/exit"):
                 self.app.exit()
                 return
-            composer = self.query_one("#composer", Input)
-            composer.value = ""
+            composer = self.query_one("#composer", ChatInput)
+            composer.text = ""
             self._add_user_row(text)
             bubble, stack = self._add_buddy_row()
             self._streaming = True
@@ -1296,6 +1336,7 @@ def _build_textual_app(cfg, llama_version, available):
             def work():
                 worker = get_current_worker()
                 acc = []
+                final = ""          # always bound, even if the loop yields nothing
                 errored = False
                 try:
                     for piece in self.controller.stream_reply(user_text):
@@ -1317,10 +1358,15 @@ def _build_textual_app(cfg, llama_version, available):
                 finally:
                     if not errored:
                         # Swap the plain streaming bubble for a rendered
-                        # Markdown view of the finished reply.
+                        # Markdown view. Fall back to the raw accumulated text
+                        # if visible_reply came back empty, and only to an
+                        # ellipsis if there was genuinely nothing at all — so a
+                        # real reply is never replaced by "...".
+                        text = final or "".join(acc).strip()
+                        if not text:
+                            text = "\u2026"
                         self.app.call_from_thread(
-                            self._render_markdown_into, stack,
-                            final or "\u2026", "md-buddy")
+                            self._render_markdown_into, stack, text, "md-buddy")
                     self.app.call_from_thread(self._finish_stream)
 
             self.run_worker(work, thread=True, exclusive=True)
@@ -1329,7 +1375,7 @@ def _build_textual_app(cfg, llama_version, available):
             self._streaming = False
             self._set_status("Ready. Enter to send \u00b7 Esc to switch buddy "
                              "\u00b7 Ctrl+R to reset")
-            self.query_one("#composer", Input).focus()
+            self.query_one("#composer", ChatInput).focus()
 
     class LoadingScreen(Screen):
         """Shown while a save-point restores so the UI never looks frozen."""
