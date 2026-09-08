@@ -475,10 +475,16 @@ GEMMA_END = "<end_of_turn>"
 
 
 def render_persona_prefix(system_text):
-    """Render the fixed persona prefix (everything that gets saved into the
-    KV cache) as a single string, ready to be tokenized. We fold the system
-    persona into the first user turn, and stop right before the model's first
-    generation so the cache ends at a clean turn boundary.
+    """Render the fixed persona prefix (everything saved into the KV cache) as
+    a single string, ready to be tokenized. The persona is a COMPLETED user
+    turn ending at <end_of_turn>; it deliberately does NOT open a model turn.
+
+    Why: every real exchange is appended with render_user_turn(), which opens
+    the user turn AND the model turn. If the prefix also ended with
+    "<start_of_turn>model", the first exchange would produce a doubled model
+    opener with a user turn wedged after it, and the model would echo
+    "<start_of_turn>model" as literal text. Ending the prefix at <end_of_turn>
+    keeps every subsequent turn well-formed.
 
     No leading <bos>: it is supplied once by the tokenizer at build time and by
     create_completion at chat time.
@@ -486,7 +492,6 @@ def render_persona_prefix(system_text):
     return (
         f"{GEMMA_START}user\n"
         f"{system_text}{GEMMA_END}\n"
-        f"{GEMMA_START}model\n"
     )
 
 
@@ -520,6 +525,26 @@ def strip_thinking(text):
                 break
             text = text[:i] + text[j + len(end):]
     return text.strip()
+
+
+def strip_control_tokens(text):
+    """Remove Gemma turn-control tokens that should never appear in a visible
+    reply (e.g. a leaked "<start_of_turn>model" opener). Defense-in-depth: a
+    correct prompt shouldn't produce these, but if one leaks we don't want the
+    user to see it. Strips the markers and any immediately following role word.
+    """
+    if not text:
+        return text
+    for marker in ("<start_of_turn>model", "<start_of_turn>user",
+                   "<start_of_turn>", "<end_of_turn>", "<bos>", "<eos>"):
+        text = text.replace(marker, "")
+    # A leaked opener often leaves a stray leading "model\n" role word.
+    stripped = text.lstrip()
+    for role in ("model\n", "model ", "model"):
+        if stripped.startswith(role):
+            stripped = stripped[len(role):]
+            break
+    return stripped.strip() if stripped is not text else text.strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -1011,10 +1036,12 @@ class ChatController:
             self.transcript += reply + f"{GEMMA_END}\n"
 
     def visible_reply(self, raw_reply):
-        """Post-process a completed reply for display (strip thinking)."""
+        """Post-process a completed reply for display (strip thinking and any
+        leaked control tokens)."""
+        text = raw_reply
         if self.variant == "yesthink":
-            return strip_thinking(raw_reply)
-        return raw_reply.strip()
+            text = strip_thinking(text)
+        return strip_control_tokens(text)
 
 
 def _build_textual_app(cfg, llama_version, available):
@@ -1062,31 +1089,31 @@ def _build_textual_app(cfg, llama_version, available):
     #log { height: 1fr; padding: 1 2; scrollbar-size-vertical: 1;
            scrollbar-gutter: stable; }
 
-    /* Rows span the full width; align-horizontal positions the bubble. A wide
-       max-width on the stack leaves only a slim central gutter (each side may
-       use up to ~86% of the row), instead of the previous 70% that left a
-       third of the screen empty down the middle. */
+    /* Rows span the full width; align-horizontal positions the bubble. The
+       stack cap is high (92%) so a longer message uses almost all of its side,
+       leaving only a slim central gutter. Short messages naturally stay small
+       (ordinary chat-bubble behaviour, not a valley). */
+    /* Each message is a full-width row; align-horizontal pushes the single
+       bubble child left (buddy) or right (user). The bubble's max-width is a
+       percentage of the row (which has a definite 1fr width), so the cap
+       actually resolves. */
     .row-buddy { width: 1fr; height: auto; align-horizontal: left;
-                 padding: 0 1 1 0; }
+                 padding: 0 1 0 0; }
     .row-user  { width: 1fr; height: auto; align-horizontal: right;
                  padding: 0 0 1 1; }
+    .speaker-row { padding: 0 0 0 0; }
 
-    .stack-buddy { width: auto; max-width: 86%; height: auto; }
-    .stack-user  { width: auto; max-width: 86%; height: auto; }
-
-    /* Bubbles are auto-width (shrink=True on the widget) but floored with a
-       min-width so a short message keeps a bubble shape, and capped by the
-       stack so a long one wraps into a wide column with only a slim gutter
-       remaining. text-wrap: wrap (the Static default) grows the height. */
+    /* Bubbles hug their content up to a max-width, then wrap. width: auto +
+       max-width with NO shrink and NO min-width: a short message stays small,
+       a long one fills up to the cap and grows in height, leaving only a slim
+       central gutter. (shrink/min-width made both collapse to a ribbon.) */
     .bubble-buddy {
-        background: #3a2f1e; color: #f4e6c8; padding: 1 2;
-        border: round #c8933b; width: auto; min-width: 32; height: auto;
-        text-wrap: wrap;
+        background: #3a2f1e; color: #f4e6c8; padding: 1 2; margin: 0 0 1 0;
+        border: round #c8933b; width: auto; max-width: 92%; height: auto;
     }
     .bubble-user {
         background: #1e2a33; color: #d6ecf5; padding: 1 2;
-        border: round #4a7fa0; width: auto; min-width: 32; height: auto;
-        text-wrap: wrap;
+        border: round #4a7fa0; width: auto; max-width: 92%; height: auto;
     }
 
     .speaker { color: $text-muted; padding: 0 1; height: 1; }
@@ -1217,27 +1244,31 @@ def _build_textual_app(cfg, llama_version, available):
             self.query_one("#status", Static).update(text)
 
         def _make_bubble(self, text: str, cls: str) -> Static:
-            """A plain Static bubble that wraps and grows with content.
-            shrink=True lets it wrap against the width cap; markup=False keeps
-            user/model text literal so stray brackets aren't parsed as Rich
-            markup."""
-            return Static(text, classes=cls, shrink=True, markup=False)
+            """A plain Static bubble that hugs its content up to a max-width,
+            then wraps and grows in height. No shrink/min-width (those made
+            bubbles collapse to a narrow ribbon). markup=False keeps user/model
+            text literal so stray brackets aren't parsed as Rich markup."""
+            return Static(text, classes=cls, markup=False)
 
         def _add_user_row(self, text: str) -> None:
             log = self.query_one("#log", VerticalScroll)
+            # Bubble sits directly in a full-width row; the row's align pushes it
+            # right and the bubble's max-width (a % of the row) caps it.
             bubble = self._make_bubble(text, "bubble-user")
-            stack = Vertical(bubble, classes="stack-user")
-            row = Horizontal(stack, classes="row-user")
+            row = Horizontal(bubble, classes="row-user")
             log.mount(row)
             log.scroll_end(animate=False)
 
         def _add_buddy_row(self) -> Static:
-            """Create an empty buddy bubble to stream into; return the Static."""
+            """Create an empty buddy bubble to stream into; return the Static.
+            The speaker tag is its own left-aligned line above the bubble."""
             log = self.query_one("#log", VerticalScroll)
+            speaker_row = Horizontal(
+                Label(self.controller.buddy, classes="speaker"),
+                classes="row-buddy speaker-row")
             bubble = self._make_bubble("", "bubble-buddy")
-            speaker = Label(self.controller.buddy, classes="speaker")
-            stack = Vertical(speaker, bubble, classes="stack-buddy")
-            row = Horizontal(stack, classes="row-buddy")
+            row = Horizontal(bubble, classes="row-buddy")
+            log.mount(speaker_row)
             log.mount(row)
             log.scroll_end(animate=False)
             return bubble
@@ -1294,6 +1325,7 @@ def _build_textual_app(cfg, llama_version, available):
                         shown = "".join(acc)
                         if self.controller.variant == "yesthink":
                             shown = strip_thinking(shown)
+                        shown = strip_control_tokens(shown)
                         self.app.call_from_thread(bubble.update, shown)
                         log = self.query_one("#log", VerticalScroll)
                         self.app.call_from_thread(log.scroll_end,
