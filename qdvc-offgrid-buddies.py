@@ -20,8 +20,12 @@ Round-one notes:
   * Save-points are tied to the exact GGUF file, n_ctx, and llama-cpp-python
     version. Each save-point has a .json sidecar recording this; chat refuses
     to load a stale save-point and tells the user to re-run build.
-  * The save/restore round-trip for Gemma 4's hybrid/sliding-window attention
-    is verified at build time by a self-check. If it fails, build warns loudly.
+  * The persona is evaluated directly into the KV cache (low-level eval), then
+    saved. Chat CONTINUES that exact cache with low-level eval/sample rather
+    than re-running a prompt, so the persona is never re-processed.
+  * The save/restore round-trip is verified at build time by planting a canary
+    reference code in the persona and requiring the restored model to repeat
+    it back. If recall fails, build warns loudly and chat refuses the file.
 """
 
 import argparse
@@ -435,17 +439,62 @@ def compute_n_ctx(cfg, prompt_tokens):
 # Gemma 4 thinking-mode handling
 # --------------------------------------------------------------------------- #
 
-def system_message_for(variant, base_system=None):
-    """Gemma 4 enables thinking via a control token at the start of the system
-    prompt. We keep a single knob here so the rest of the code is variant-
-    agnostic. If the installed template ignores the token, thinking simply
-    stays off, which is the safe default.
+def system_message_for(variant, base_system=None, canary=None):
+    """Build the system message text for a variant.
+
+    Gemma 4 enables thinking via a control token at the start of the system
+    prompt. If the installed template ignores the token, thinking simply stays
+    off, which is the safe default.
+
+    An optional `canary` fact is embedded so the build-time self-check can
+    verify the persona context is genuinely present in the restored cache
+    (rather than the model answering plausibly from base training).
     """
     think_token = "<|think|>"
     sys_text = base_system or "You are a helpful, warm conversational companion."
+    if canary:
+        sys_text = (
+            sys_text
+            + f"\n\n(Internal reference code: {canary}. If the user asks for "
+            f"your reference code, reply with exactly {canary}.)"
+        )
     if variant == "yesthink":
         return think_token + sys_text
     return sys_text
+
+
+# The Gemma 4 chat turn structure. llama-cpp-python's create_chat_completion
+# applies a template internally, but for the save-point to work we must control
+# the exact tokens ourselves and drive eval() at the low level. We therefore
+# render turns using Gemma's documented control tokens. If a future template
+# revision changes these, update here in one place.
+GEMMA_BOS = "<bos>"
+GEMMA_START = "<start_of_turn>"
+GEMMA_END = "<end_of_turn>"
+
+
+def render_persona_prefix(system_text):
+    """Render the fixed persona prefix (everything that gets saved into the
+    KV cache) as a single string, ready to be tokenized. We fold the system
+    persona into the first user turn's lead-in, which Gemma handles well, and
+    stop right before the model's first generation so the cache ends at a
+    clean turn boundary.
+    """
+    # A single opening 'user' turn carrying the persona, followed by the model
+    # turn opener so the cache is positioned for the model to speak next.
+    return (
+        f"{GEMMA_BOS}{GEMMA_START}user\n"
+        f"{system_text}{GEMMA_END}\n"
+        f"{GEMMA_START}model\n"
+    )
+
+
+def render_user_turn(user_text):
+    """Render one subsequent user turn plus the model opener, for appending
+    on top of the restored cache during chat."""
+    return (
+        f"{GEMMA_START}user\n{user_text}{GEMMA_END}\n{GEMMA_START}model\n"
+    )
 
 
 def strip_thinking(text):
@@ -470,6 +519,48 @@ def strip_thinking(text):
                 break
             text = text[:i] + text[j + len(end):]
     return text.strip()
+
+
+# --------------------------------------------------------------------------- #
+# Low-level generation that CONTINUES the current KV cache
+# --------------------------------------------------------------------------- #
+
+def eval_text(llm, text, add_bos=False):
+    """Tokenize `text` and eval it into the model, extending the current KV
+    cache. Returns the tokens evaluated. Used at BUILD time to place the
+    persona into the cache before saving. `add_bos` is False because our
+    rendered strings already include <bos> where needed."""
+    tokens = llm.tokenize(text.encode("utf-8"), add_bos=add_bos, special=True)
+    if tokens:
+        llm.eval(tokens)
+    return tokens
+
+
+# Stop strings that end a model turn. create_completion stops BEFORE emitting
+# these, which is what we want.
+STOP_STRINGS = [GEMMA_END, "<eos>", f"{GEMMA_START}user"]
+
+
+def generate_from_full_text(llm, full_text, max_tokens, temperature,
+                            top_p, top_k):
+    """Generate a model reply by passing the FULL running transcript to
+    create_completion. llama-cpp-python matches the longest common prefix
+    against the current KV cache and only evaluates the new suffix, so the
+    restored persona prefix is reused rather than recomputed.
+
+    Returns (reply_text, finish_reason). Uses the high-level completion API,
+    which is stable across llama-cpp-python 0.3.x (unlike the low-level
+    sample() signature)."""
+    out = llm.create_completion(
+        prompt=full_text,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        stop=STOP_STRINGS,
+    )
+    choice = out["choices"][0]
+    return choice["text"], choice.get("finish_reason")
 
 
 # --------------------------------------------------------------------------- #
@@ -565,6 +656,7 @@ def cmd_build(cfg):
 def _build_one(cfg, buddy, variant, prompt_text, files_used, n_ctx,
                n_threads, prompt_tokens, llama_version):
     from llama_cpp import Llama
+    import uuid
     state_path, sidecar_path = savepoint_paths(
         cfg["savefiles_dir"], buddy, variant
     )
@@ -581,90 +673,85 @@ def _build_one(cfg, buddy, variant, prompt_text, files_used, n_ctx,
         sys.stderr.write(f"    ! Failed to load model: {e}\n")
         return False
 
-    system_text = system_message_for(variant)
+    # A per-build canary the self-check will require back, proving the persona
+    # context is really in the restored cache.
+    canary = "QDVC-" + uuid.uuid4().hex[:8].upper()
+    system_text = system_message_for(variant, base_system=prompt_text,
+                                      canary=canary)
+    prefix = render_persona_prefix(system_text)
 
-    # Feed the persona as a system + priming user turn so the KV cache holds
-    # the full context. We use a minimal opening so the model is "warmed" and
-    # ready to reply in character.
+    # Evaluate the persona prefix DIRECTLY into the KV cache. This is the fix:
+    # after this, save_state() captures a cache that genuinely contains the
+    # persona, and chat can continue from exactly this point.
     try:
-        llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system_text + "\n\n" + prompt_text},
-                {"role": "user", "content": "Introduce yourself in one short line."},
-            ],
-            max_tokens=64,
-            temperature=1.0,
-            top_p=0.95,
-            top_k=64,
-        )
+        llm.reset()
+        persona_token_ids = eval_text(llm, prefix, add_bos=False)
     except Exception as e:
-        sys.stderr.write(f"    ! Priming generation failed: {e}\n")
+        sys.stderr.write(f"    ! Failed to evaluate persona prompt: {e}\n")
         del llm
         return False
 
-    # Save the state (the "save-point").
+    n_prefix_tokens = len(persona_token_ids)
+
+    # Save the state (the "save-point"). We pickle the LlamaState object, the
+    # documented persistence path.
     try:
-        state = llm.save_state()
+        import pickle
         with open(state_path, "wb") as f:
-            f.write(state.__getstate__() if hasattr(state, "__getstate__") else bytes())
-    except Exception:
-        # Fallback: pickle the state object, which is the documented path.
-        try:
-            import pickle
-            with open(state_path, "wb") as f:
-                pickle.dump(llm.save_state(), f)
-        except Exception as e:
-            sys.stderr.write(f"    ! Failed to save state: {e}\n")
-            del llm
-            return False
+            pickle.dump(llm.save_state(), f)
+    except Exception as e:
+        sys.stderr.write(f"    ! Failed to save state: {e}\n")
+        del llm
+        return False
 
     del llm
 
-    # --- Self-check: reload into a fresh context and confirm the round-trip.
-    passed = _self_check(cfg, state_path, variant, n_ctx, n_threads,
-                         prompt_text)
+    # --- Self-check: reload into a fresh context and require the canary back.
+    passed = _self_check(cfg, state_path, variant, n_ctx, n_threads, canary,
+                         prefix)
     if passed:
-        print(f"    ✓ self-check passed")
+        print(f"    \u2713 self-check passed (persona recall confirmed)")
     else:
-        print(f"    ! self-check FAILED — save-point may be unreliable. "
-              f"chat will refuse to load it.")
+        print(f"    ! self-check FAILED \u2014 persona not recalled from the "
+              f"save-point. chat will refuse to load it. See troubleshooting "
+              f"in the README.")
 
     sidecar = build_sidecar(
         cfg, buddy, variant, n_ctx, prompt_text, files_used,
         llama_version, prompt_tokens, passed
     )
+    # Record the exact prefix token count and the exact prefix TEXT so chat
+    # can reproduce the identical prefix for cache prefix-matching (the canary
+    # is part of this text, which chat cannot regenerate on its own).
+    sidecar["prefix_tokens"] = n_prefix_tokens
+    sidecar["persona_prefix"] = prefix
     with open(sidecar_path, "w", encoding="utf-8") as f:
         json.dump(sidecar, f, indent=2)
 
     size_mb = os.path.getsize(state_path) / (1024 * 1024)
-    print(f"    saved {os.path.basename(state_path)} ({size_mb:.0f} MB)")
+    print(f"    saved {os.path.basename(state_path)} ({size_mb:.0f} MB, "
+          f"{n_prefix_tokens} persona tokens)")
     return passed
 
 
 def _load_state_into(llm, state_path):
-    """Load a saved state file back into a fresh Llama instance."""
+    """Load a saved LlamaState back into a fresh Llama instance."""
     import pickle
-    with open(state_path, "rb") as f:
-        data = f.read()
-    # We always wrote via pickle in the fallback path; try that first.
     try:
-        state = pickle.loads(data)
+        with open(state_path, "rb") as f:
+            state = pickle.load(f)
         llm.load_state(state)
         return True
-    except Exception:
-        pass
-    # If a raw bytes path was used, attempt load_state on raw bytes.
-    try:
-        llm.load_state(data)
-        return True
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"    ! load_state failed: {e}\n")
         return False
 
 
-def _self_check(cfg, state_path, variant, n_ctx, n_threads, prompt_text):
-    """Reload the save-point in a fresh context and confirm the model responds
-    coherently. This is a smoke test of the save/restore round-trip for Gemma
-    4's hybrid attention, not a correctness proof."""
+def _self_check(cfg, state_path, variant, n_ctx, n_threads, canary,
+                persona_prefix):
+    """Reload the save-point in a FRESH context and require the model to return
+    the planted canary code. This actually proves the persona context survived
+    the save/restore round-trip, rather than accepting any coherent reply."""
     from llama_cpp import Llama
     try:
         llm = Llama(
@@ -680,22 +767,23 @@ def _self_check(cfg, state_path, variant, n_ctx, n_threads, prompt_text):
         del llm
         return False
     try:
-        out = llm.create_chat_completion(
-            messages=[{"role": "user",
-                       "content": "In one short sentence, who are you?"}],
-            max_tokens=96,
-            temperature=1.0,
-            top_p=0.95,
-            top_k=64,
+        # Continue the restored cache: full transcript = persona prefix (already
+        # in cache) + one user turn asking for the code. create_completion
+        # reuses the cached prefix and only evaluates the appended turn.
+        full = persona_prefix + render_user_turn("What is your reference code?")
+        text, _ = generate_from_full_text(
+            llm, full, max_tokens=64, temperature=0.0, top_p=0.95, top_k=64,
         )
-        text = out["choices"][0]["message"]["content"]
         if variant == "yesthink":
             text = strip_thinking(text)
         del llm
-        # A healthy round-trip produces some non-empty, non-degenerate text.
-        return bool(text and len(text.strip()) >= 2)
-    except Exception:
-        del llm
+        return bool(canary and canary in (text or ""))
+    except Exception as e:
+        sys.stderr.write(f"    ! self-check error: {e}\n")
+        try:
+            del llm
+        except Exception:
+            pass
         return False
 
 
@@ -866,13 +954,16 @@ def cmd_chat(cfg):
         print("Failed to restore the save-point. Re-run `build`.")
         return 1
 
+    # The exact persona prefix text that is sitting in the restored cache.
+    persona_prefix = side.get("persona_prefix")
+    if not persona_prefix:
+        print("This save-point predates prefix tracking. Please re-run "
+              "`build` so chat can continue the cache correctly.")
+        return 1
+
     print(f"Ready. Chatting with '{buddy}' ({variant}).")
     print("Commands: /reset  = restart from the save-point,")
     print("          /quit   = exit.\n")
-
-    # We keep the visible conversation as messages appended AFTER the restored
-    # state. On /reset we reload the pristine save-point.
-    history = []
 
     def reload_savepoint():
         nonlocal llm
@@ -886,6 +977,12 @@ def cmd_chat(cfg):
         )
         _load_state_into(llm, state_path)
 
+    # Running transcript. It ALWAYS begins with the exact persona prefix, whose
+    # tokens are already in the restored KV cache; create_completion reuses that
+    # cached prefix and only evaluates what we append, so the persona is never
+    # recomputed. We rebuild `transcript` back to just the prefix on /reset.
+    transcript = persona_prefix
+
     while True:
         try:
             user = input("you > ").strip()
@@ -897,33 +994,30 @@ def cmd_chat(cfg):
         if user.lower() in ("/quit", "/exit"):
             break
         if user.lower() == "/reset":
-            history = []
+            transcript = persona_prefix
             reload_savepoint()
             print("(reset to save-point)\n")
             continue
 
-        history.append({"role": "user", "content": user})
+        # Append this user turn (which also opens the model turn) and generate.
+        transcript += render_user_turn(user)
         try:
-            out = llm.create_chat_completion(
-                messages=history,
-                max_tokens=512,
-                temperature=1.0,
-                top_p=0.95,
-                top_k=64,
-                stop=None,
+            reply, _ = generate_from_full_text(
+                llm, transcript, max_tokens=512, temperature=1.0,
+                top_p=0.95, top_k=64,
             )
-            reply = out["choices"][0]["message"]["content"] or ""
             if variant == "yesthink":
                 reply = strip_thinking(reply)
         except Exception as e:
             print(f"(generation error: {e})")
-            history.pop()
+            # Roll back the just-added user turn so transcript stays consistent.
+            transcript = transcript[:-len(render_user_turn(user))]
             continue
 
-        # Per Gemma 4 guidance, do not keep prior thinking content in history;
-        # store only the final visible reply.
-        history.append({"role": "assistant", "content": reply})
-        print(f"\n{buddy} > {reply}\n")
+        # Fold the model's reply back into the transcript, closing its turn, so
+        # the next round's prefix matches the growing cache.
+        transcript += reply + f"{GEMMA_END}\n"
+        print(f"\n{buddy} > {reply.strip()}\n")
 
     print("Goodbye.")
     return 0

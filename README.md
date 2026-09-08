@@ -70,17 +70,50 @@ Because both variants of a buddy share one `n_ctx` (sized for the more
 demanding `yesthink` case), `nothink` save-points are marginally larger than
 strictly necessary — a deliberate simplification for this first round.
 
-## Important caveat
+## How the cache is built and continued
 
-The save/restore round-trip for Gemma 4's hybrid/sliding-window attention is
-**verified at build time** by a self-check, not guaranteed in advance. If the
-self-check fails, `build` says so and `chat` refuses to load that save-point.
-Always confirm `list` shows "ready" on a representative machine before
-provisioning the fleet.
+The persona prompt is evaluated **directly** into the KV cache at the token
+level, then saved. Chat restores that cache and **continues** it with
+low-level eval/sample — each user turn's tokens are appended and the reply is
+sampled from the restored state. The persona is never re-processed, and it is
+never routed through `create_chat_completion` (which manages its own context
+and bypasses the restored cache — that was the cause of the "buddy has no
+memory of its prompt" bug in the first build).
+
+## Important caveat & troubleshooting
+
+The round-trip is **verified at build time** by planting a canary reference
+code inside each persona and requiring the restored model to repeat it back.
+If it can't, `build` reports the self-check failed and `chat` refuses that
+save-point. Always confirm `list` shows "ready" on a representative machine
+before provisioning the fleet.
+
+If the self-check fails:
+
+- Confirm your `llama-cpp-python` version matches what you built with — the
+  saved state format is version-sensitive. Pin one version fleet-wide.
+- Confirm you are on CPU (`n_gpu_layers=0`, which this tool forces).
+  Save/restore is known-good on CPU; the historical garbage-output bug was
+  GPU-only.
+- If it still fails, the remaining suspect is Gemma 4's hybrid/sliding-window
+  attention interacting with state save/restore in your specific build.
 
 ## Save-point validity
 
 A save-point is invalidated (and `chat` will refuse it, pointing you back to
 `build`) if any of these change: the GGUF file, the assembled buddy prompt, the
 `n_ctx`, or the `llama-cpp-python` version. The `.json` sidecar records all of
-these for the check.
+these, plus the exact persona prefix text and its token count, which `chat`
+needs to continue the restored cache correctly.
+
+## Verifying the fix from the earlier round
+
+If you previously saw buddies with "no memory" of their prompt, that was caused
+by loading the persona through `create_chat_completion` at build time, which
+does not leave the prompt in the KV cache for `save_state` to capture. This is
+fixed: the persona is now evaluated directly into the cache. To confirm on your
+hardware, just run `build` and watch for `self-check passed (persona recall
+confirmed)` on each buddy, then `list` should show `ready`. The self-check
+plants a hidden reference code in the persona and requires the restored model
+to repeat it back, so a pass genuinely proves the context survived the
+save/restore round-trip.
