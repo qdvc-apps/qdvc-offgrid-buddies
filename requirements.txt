@@ -9,6 +9,10 @@ llama-cpp-python
 
 PyYAML>=6.0
 
+# The `chat` command's text UI (arrow-key buddy picker, streaming styled chat).
+# Pin one version across all laptops for consistent rendering.
+textual
+
 # Optional but recommended: enables the most accurate physical-core and RAM
 # detection in `benchmark` and thread auto-detection. Without it, the tool
 # falls back to /proc parsing and os.cpu_count() heuristics.

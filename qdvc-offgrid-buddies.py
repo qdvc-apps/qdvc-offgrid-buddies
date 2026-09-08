@@ -569,6 +569,26 @@ def generate_from_full_text(llm, full_text, max_tokens, temperature,
     return choice["text"], choice.get("finish_reason")
 
 
+def stream_from_full_text(llm, full_text, max_tokens, temperature,
+                          top_p, top_k):
+    """Like generate_from_full_text, but yields text chunks as they are
+    produced (create_completion(stream=True)). Used by the TUI so replies
+    appear token-by-token, which also reassures the user on a slow CPU that
+    something is happening. Yields str chunks; the caller concatenates them."""
+    for part in llm.create_completion(
+        prompt=full_text,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        stop=STOP_STRINGS,
+        stream=True,
+    ):
+        piece = part["choices"][0].get("text", "")
+        if piece:
+            yield piece
+
+
 # --------------------------------------------------------------------------- #
 # Command: build
 # --------------------------------------------------------------------------- #
@@ -884,148 +904,340 @@ def cmd_benchmark(cfg_or_none):
 
 
 # --------------------------------------------------------------------------- #
-# Command: chat
+# Command: chat (Textual TUI)
 # --------------------------------------------------------------------------- #
 
-def _prompt_choice(title, options):
-    """Simple numbered-menu selector. Returns chosen index or None to quit."""
-    print(f"\n{title}")
-    for i, label in enumerate(options, 1):
-        print(f"  {i}. {label}")
-    print("  q. quit")
-    while True:
-        choice = input("> ").strip().lower()
-        if choice == "q":
-            return None
-        if choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(options):
-                return idx
-        print("Please enter a listed number, or q to quit.")
+def _gather_available(cfg, llama_version):
+    """Return [(buddy, [ready_variants...]), ...] for buddies with a valid
+    save-point. Shared by the TUI launch screen."""
+    available = []
+    for buddy in discover_buddies(cfg["buddies_dir"]):
+        ready = []
+        for variant in VARIANTS:
+            ok, _, _ = validate_savepoint(cfg, buddy, variant, llama_version)
+            if ok:
+                ready.append(variant)
+        if ready:
+            available.append((buddy, ready))
+    return available
+
+
+def _import_textual():
+    try:
+        import textual  # noqa: F401
+        return True
+    except ImportError:
+        sys.stderr.write(
+            "Error: the chat interface needs Textual. Install it with:\n"
+            "    pip install textual\n"
+            "Pin the version across all target laptops (see requirements.txt).\n"
+        )
+        return False
+
+
+class ChatController:
+    """Owns the model instance and the running transcript for one buddy/variant.
+    Kept separate from the UI so the Textual widgets stay thin. All model calls
+    happen off the UI thread (Textual workers)."""
+
+    def __init__(self, cfg, buddy, variant, side):
+        self.cfg = cfg
+        self.buddy = buddy
+        self.variant = variant
+        self.side = side
+        self.n_ctx = side["n_ctx"]
+        self.n_threads = effective_threads(cfg)
+        self.state_path, _ = savepoint_paths(
+            cfg["savefiles_dir"], buddy, variant
+        )
+        self.persona_prefix = side.get("persona_prefix")
+        self.llm = None
+        self.transcript = self.persona_prefix or ""
+
+    def load(self):
+        """Load the model and restore the save-point. Returns (ok, message)."""
+        if not self.persona_prefix:
+            return False, ("This save-point predates prefix tracking. "
+                           "Re-run build.")
+        from llama_cpp import Llama
+        self.llm = Llama(
+            model_path=self.cfg["gguf_path"],
+            n_ctx=self.n_ctx,
+            n_threads=self.n_threads,
+            n_gpu_layers=0,
+            verbose=False,
+        )
+        if not _load_state_into(self.llm, self.state_path):
+            return False, "Failed to restore the save-point. Re-run build."
+        return True, "ready"
+
+    def reset(self):
+        """Reload the pristine save-point and clear the conversation."""
+        from llama_cpp import Llama
+        self.llm = Llama(
+            model_path=self.cfg["gguf_path"],
+            n_ctx=self.n_ctx,
+            n_threads=self.n_threads,
+            n_gpu_layers=0,
+            verbose=False,
+        )
+        _load_state_into(self.llm, self.state_path)
+        self.transcript = self.persona_prefix
+
+    def stream_reply(self, user_text):
+        """Generator: append the user turn, then yield reply chunks as they
+        generate. Folds the finished reply back into the transcript."""
+        self.transcript += render_user_turn(user_text)
+        collected = []
+        try:
+            for piece in stream_from_full_text(
+                self.llm, self.transcript, max_tokens=512,
+                temperature=1.0, top_p=0.95, top_k=64,
+            ):
+                collected.append(piece)
+                yield piece
+        finally:
+            reply = "".join(collected)
+            # Keep the transcript consistent with what the cache now holds.
+            self.transcript += reply + f"{GEMMA_END}\n"
+
+    def visible_reply(self, raw_reply):
+        """Post-process a completed reply for display (strip thinking)."""
+        if self.variant == "yesthink":
+            return strip_thinking(raw_reply)
+        return raw_reply.strip()
+
+
+def _build_textual_app(cfg, llama_version, available):
+    """Construct and return the Textual App. Imports are local so the rest of
+    the tool runs without Textual installed."""
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Vertical, VerticalScroll
+    from textual.screen import Screen
+    from textual.widgets import (Footer, Header, Input, Label, ListItem,
+                                 ListView, Static)
+
+    # ------- palette: warm companion (left) vs cool self (right) -------------
+    # One load-bearing choice: the buddy speaks in warm amber from the left,
+    # you speak in cool slate from the right. Everything else stays quiet.
+    APP_CSS = """
+    Screen { background: $surface; }
+
+    /* Launch screen */
+    #launch-wrap { align: center middle; height: 1fr; }
+    #launch-title { content-align: center middle; height: 3; text-style: bold; }
+    #launch-hint { content-align: center middle; color: $text-muted; height: 2; }
+    ListView { width: 60; height: auto; max-height: 20; background: $surface;
+               border: round $primary; padding: 1 1; }
+    ListItem { padding: 1 2; }
+    ListItem > Label { width: 1fr; }
+    ListItem.--highlight { background: $primary 25%; }
+
+    /* Chat screen */
+    #log { height: 1fr; padding: 1 2; }
+    .row-buddy { width: 1fr; content-align: left middle; padding: 0 0 1 0; }
+    .row-user  { width: 1fr; content-align: right middle; padding: 0 0 1 0; }
+    .bubble-buddy {
+        background: #3a2f1e; color: #f4e6c8; padding: 1 2;
+        border: round #c8933b; width: auto; max-width: 70%;
+    }
+    .bubble-user {
+        background: #1e2a33; color: #d6ecf5; padding: 1 2;
+        border: round #4a7fa0; width: auto; max-width: 70%;
+    }
+    .speaker { color: $text-muted; padding: 0 1; }
+    #composer { dock: bottom; height: 3; border: round $primary; }
+    #status { dock: bottom; height: 1; color: $text-muted; padding: 0 2; }
+    """
+
+    class BuddyList(ListView):
+        """Arrow-key selectable buddy list on the launch screen."""
+        pass
+
+    class LaunchScreen(Screen):
+        BINDINGS = [Binding("q", "quit_app", "Quit")]
+
+        def compose(self) -> ComposeResult:
+            yield Header(show_clock=False)
+            items = []
+            for buddy, ready in available:
+                variants = ", ".join(ready)
+                items.append(
+                    ListItem(Label(f"{buddy}\n[dim]{variants}[/dim]"),
+                             id=f"buddy-{buddy}")
+                )
+            with Vertical(id="launch-wrap"):
+                yield Static("Choose who to talk with", id="launch-title")
+                yield BuddyList(*items)
+                yield Static("\u2191\u2193 to move \u00b7 Enter to open "
+                             "\u00b7 q to quit", id="launch-hint")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self.query_one(BuddyList).focus()
+
+        def on_list_view_selected(self, event) -> None:
+            buddy = event.item.id.replace("buddy-", "", 1)
+            ready = dict(available)[buddy]
+            # Round-one behaviour: if both variants exist, open the first
+            # (nothink) by default. A variant chooser is a planned follow-up;
+            # for now, build only the variant you want as the default, or set
+            # thinking flags in config.yml accordingly.
+            variant = ready[0]
+            self.app.open_chat(buddy, variant)
+
+        def action_quit_app(self) -> None:
+            self.app.exit()
+
+    class ChatScreen(Screen):
+        BINDINGS = [
+            Binding("escape", "back", "Switch buddy"),
+            Binding("ctrl+r", "reset", "Reset chat"),
+        ]
+
+        def __init__(self, controller: ChatController):
+            super().__init__()
+            self.controller = controller
+            self._streaming = False
+
+        def compose(self) -> ComposeResult:
+            yield Header(show_clock=False)
+            yield VerticalScroll(id="log")
+            yield Static("", id="status")
+            yield Input(placeholder=f"Message {self.controller.buddy}\u2026",
+                        id="composer")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self.title = self.controller.buddy
+            self.sub_title = self.controller.variant
+            self.query_one("#composer", Input).focus()
+            self._set_status("Ready. Enter to send \u00b7 Esc to switch buddy "
+                             "\u00b7 Ctrl+R to reset")
+
+        def _set_status(self, text: str) -> None:
+            self.query_one("#status", Static).update(text)
+
+        def _add_user_row(self, text: str) -> None:
+            log = self.query_one("#log", VerticalScroll)
+            row = Static(text, classes="bubble-user")
+            wrap = Vertical(row, classes="row-user")
+            log.mount(wrap)
+            log.scroll_end(animate=False)
+
+        def _add_buddy_row(self) -> Static:
+            """Create an empty buddy bubble to stream into; return the Static."""
+            log = self.query_one("#log", VerticalScroll)
+            bubble = Static("", classes="bubble-buddy")
+            speaker = Label(self.controller.buddy, classes="speaker")
+            wrap = Vertical(speaker, bubble, classes="row-buddy")
+            log.mount(wrap)
+            log.scroll_end(animate=False)
+            return bubble
+
+        def on_input_submitted(self, event) -> None:
+            if self._streaming:
+                return
+            text = event.value.strip()
+            if not text:
+                return
+            composer = self.query_one("#composer", Input)
+            composer.value = ""
+            self._add_user_row(text)
+            bubble = self._add_buddy_row()
+            self._streaming = True
+            self._set_status(f"{self.controller.buddy} is thinking\u2026")
+            self._run_generation(text, bubble)
+
+        def action_back(self) -> None:
+            if self._streaming:
+                return
+            self.app.pop_screen()
+
+        def action_reset(self) -> None:
+            if self._streaming:
+                return
+            self.controller.reset()
+            log = self.query_one("#log", VerticalScroll)
+            log.remove_children()
+            self._set_status("Conversation reset to the save-point.")
+
+        # -- streaming runs in a worker thread; UI updates via call_from_thread
+        def _run_generation(self, user_text: str, bubble) -> None:
+            from textual.worker import get_current_worker
+
+            def work():
+                worker = get_current_worker()
+                acc = []
+                try:
+                    for piece in self.controller.stream_reply(user_text):
+                        if worker.is_cancelled:
+                            break
+                        acc.append(piece)
+                        shown = "".join(acc)
+                        if self.controller.variant == "yesthink":
+                            shown = strip_thinking(shown)
+                        self.app.call_from_thread(bubble.update, shown)
+                        log = self.query_one("#log", VerticalScroll)
+                        self.app.call_from_thread(log.scroll_end,
+                                                  animate=False)
+                    final = self.controller.visible_reply("".join(acc))
+                    self.app.call_from_thread(bubble.update, final or "\u2026")
+                except Exception as e:
+                    self.app.call_from_thread(
+                        bubble.update, f"[i](generation error: {e})[/i]")
+                finally:
+                    self.app.call_from_thread(self._finish_stream)
+
+            self.run_worker(work, thread=True, exclusive=True)
+
+        def _finish_stream(self) -> None:
+            self._streaming = False
+            self._set_status("Ready. Enter to send \u00b7 Esc to switch buddy "
+                             "\u00b7 Ctrl+R to reset")
+            self.query_one("#composer", Input).focus()
+
+    class BuddiesApp(App):
+        CSS = APP_CSS
+        TITLE = "off-grid buddies"
+
+        def on_mount(self) -> None:
+            self.push_screen(LaunchScreen())
+
+        def open_chat(self, buddy, variant):
+            ok, reason, side = validate_savepoint(
+                cfg, buddy, variant, llama_version
+            )
+            if not ok:
+                self.bell()
+                self.push_screen(LaunchScreen())
+                return
+            controller = ChatController(cfg, buddy, variant, side)
+            loaded, msg = controller.load()
+            if not loaded:
+                self.bell()
+                return
+            self.push_screen(ChatScreen(controller))
+
+    return BuddiesApp()
 
 
 def cmd_chat(cfg):
     llama_cpp = _import_llama()
-    from llama_cpp import Llama
+    from llama_cpp import Llama  # noqa: F401  (ensures clear error if missing)
     llama_version = getattr(llama_cpp, "__version__", "unknown")
 
-    buddies = discover_buddies(cfg["buddies_dir"])
-    # Determine which buddies have at least one valid variant.
-    available = []
-    for buddy in buddies:
-        variants_ready = []
-        for variant in VARIANTS:
-            ok, _, _ = validate_savepoint(cfg, buddy, variant, llama_version)
-            if ok:
-                variants_ready.append(variant)
-        if variants_ready:
-            available.append((buddy, variants_ready))
+    if not _import_textual():
+        return 2
 
+    available = _gather_available(cfg, llama_version)
     if not available:
         print("No buddies have a valid save-point. Run `build` first.")
         return 1
 
-    labels = [f"{b}  ({', '.join(v)})" for b, v in available]
-    idx = _prompt_choice("Choose a buddy:", labels)
-    if idx is None:
-        return 0
-    buddy, variants_ready = available[idx]
-
-    if len(variants_ready) == 1:
-        variant = variants_ready[0]
-    else:
-        vidx = _prompt_choice("Thinking mode:", variants_ready)
-        if vidx is None:
-            return 0
-        variant = variants_ready[vidx]
-
-    ok, reason, side = validate_savepoint(cfg, buddy, variant, llama_version)
-    if not ok:
-        print(f"That save-point is not usable: {reason}. Re-run `build`.")
-        return 1
-
-    n_ctx = side["n_ctx"]
-    n_threads = effective_threads(cfg)
-    state_path, _ = savepoint_paths(cfg["savefiles_dir"], buddy, variant)
-
-    print(f"\nLoading {buddy} [{variant}] ...")
-    llm = Llama(
-        model_path=cfg["gguf_path"],
-        n_ctx=n_ctx,
-        n_threads=n_threads,
-        n_gpu_layers=0,
-        verbose=False,
-    )
-    if not _load_state_into(llm, state_path):
-        print("Failed to restore the save-point. Re-run `build`.")
-        return 1
-
-    # The exact persona prefix text that is sitting in the restored cache.
-    persona_prefix = side.get("persona_prefix")
-    if not persona_prefix:
-        print("This save-point predates prefix tracking. Please re-run "
-              "`build` so chat can continue the cache correctly.")
-        return 1
-
-    print(f"Ready. Chatting with '{buddy}' ({variant}).")
-    print("Commands: /reset  = restart from the save-point,")
-    print("          /quit   = exit.\n")
-
-    def reload_savepoint():
-        nonlocal llm
-        del llm
-        llm = Llama(
-            model_path=cfg["gguf_path"],
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            n_gpu_layers=0,
-            verbose=False,
-        )
-        _load_state_into(llm, state_path)
-
-    # Running transcript. It ALWAYS begins with the exact persona prefix, whose
-    # tokens are already in the restored KV cache; create_completion reuses that
-    # cached prefix and only evaluates what we append, so the persona is never
-    # recomputed. We rebuild `transcript` back to just the prefix on /reset.
-    transcript = persona_prefix
-
-    while True:
-        try:
-            user = input("you > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if not user:
-            continue
-        if user.lower() in ("/quit", "/exit"):
-            break
-        if user.lower() == "/reset":
-            transcript = persona_prefix
-            reload_savepoint()
-            print("(reset to save-point)\n")
-            continue
-
-        # Append this user turn (which also opens the model turn) and generate.
-        transcript += render_user_turn(user)
-        try:
-            reply, _ = generate_from_full_text(
-                llm, transcript, max_tokens=512, temperature=1.0,
-                top_p=0.95, top_k=64,
-            )
-            if variant == "yesthink":
-                reply = strip_thinking(reply)
-        except Exception as e:
-            print(f"(generation error: {e})")
-            # Roll back the just-added user turn so transcript stays consistent.
-            transcript = transcript[:-len(render_user_turn(user))]
-            continue
-
-        # Fold the model's reply back into the transcript, closing its turn, so
-        # the next round's prefix matches the growing cache.
-        transcript += reply + f"{GEMMA_END}\n"
-        print(f"\n{buddy} > {reply.strip()}\n")
-
-    print("Goodbye.")
+    app = _build_textual_app(cfg, llama_version, available)
+    app.run()
     return 0
 
 

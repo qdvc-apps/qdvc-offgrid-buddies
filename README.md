@@ -58,8 +58,13 @@ Two thinking-mode variants can be built per buddy:
   (or why they aren't).
 
 - `python qdvc-offgrid-buddies.py chat`
-  Pick a buddy (and, if both were built, a thinking mode) and chat.
-  In-chat commands: `/reset` restarts from the save-point; `/quit` exits.
+  Opens a text UI. A launch screen lists every buddy with a ready save-point;
+  move with the up/down arrows and press Enter to open one. The chat screen
+  streams the buddy's reply as it generates. Your messages appear right-aligned
+  in cool slate; the buddy's appear left-aligned in warm amber, so the two are
+  easy to tell apart at a glance. Press Esc to go back and switch buddy, Ctrl+R
+  to reset the conversation to the save-point, and q (on the launch screen) to
+  quit.
 
 ## Sizing notes
 
