@@ -158,6 +158,10 @@ def load_config(config_path):
     cfg["n_ctx_round_to"] = int(tun.get("n_ctx_round_to", 512))
     # Floor: never build a save-point with less than this much total context.
     cfg["min_n_ctx"] = int(tun.get("min_n_ctx", 2048))
+    # Max tokens generated per chat reply. If a reply hits this it is cut off
+    # mid-thought and the UI warns; raise it for longer answers (at the cost of
+    # more runway consumed per turn). Must comfortably fit within n_ctx.
+    cfg["reply_max_tokens"] = int(tun.get("reply_max_tokens", 1024))
 
     cfg["_config_path"] = os.path.abspath(config_path)
     return cfg
@@ -595,11 +599,16 @@ def generate_from_full_text(llm, full_text, max_tokens, temperature,
 
 
 def stream_from_full_text(llm, full_text, max_tokens, temperature,
-                          top_p, top_k):
+                          top_p, top_k, result=None):
     """Like generate_from_full_text, but yields text chunks as they are
     produced (create_completion(stream=True)). Used by the TUI so replies
     appear token-by-token, which also reassures the user on a slow CPU that
-    something is happening. Yields str chunks; the caller concatenates them."""
+    something is happening. Yields str chunks; the caller concatenates them.
+
+    If a `result` dict is passed, its "finish_reason" key is set from the final
+    chunk once streaming ends: "length" means generation hit the max_tokens cap
+    (the reply was truncated), "stop" means it ended naturally at a stop token.
+    The caller can use this to warn the user about a cut-off reply."""
     for part in llm.create_completion(
         prompt=full_text,
         max_tokens=max_tokens,
@@ -609,7 +618,11 @@ def stream_from_full_text(llm, full_text, max_tokens, temperature,
         stop=STOP_STRINGS,
         stream=True,
     ):
-        piece = part["choices"][0].get("text", "")
+        choice = part["choices"][0]
+        piece = choice.get("text", "")
+        fr = choice.get("finish_reason")
+        if fr is not None and result is not None:
+            result["finish_reason"] = fr
         if piece:
             yield piece
 
@@ -978,6 +991,7 @@ class ChatController:
         self.persona_prefix = side.get("persona_prefix")
         self.llm = None
         self.transcript = self.persona_prefix or ""
+        self.last_truncated = False
 
     def load(self, on_before_restore=None):
         """Load the model and restore the save-point. Returns (ok, message).
@@ -1020,13 +1034,18 @@ class ChatController:
 
     def stream_reply(self, user_text):
         """Generator: append the user turn, then yield reply chunks as they
-        generate. Folds the finished reply back into the transcript."""
+        generate. Folds the finished reply back into the transcript. After the
+        generator is exhausted, self.last_truncated is True if the reply hit
+        the max-tokens cap (so the UI can warn the user)."""
         self.transcript += render_user_turn(user_text)
         collected = []
+        result = {}
+        self.last_truncated = False
+        max_tokens = int(self.cfg.get("reply_max_tokens", 1024))
         try:
             for piece in stream_from_full_text(
-                self.llm, self.transcript, max_tokens=512,
-                temperature=1.0, top_p=0.95, top_k=64,
+                self.llm, self.transcript, max_tokens=max_tokens,
+                temperature=1.0, top_p=0.95, top_k=64, result=result,
             ):
                 collected.append(piece)
                 yield piece
@@ -1034,6 +1053,7 @@ class ChatController:
             reply = "".join(collected)
             # Keep the transcript consistent with what the cache now holds.
             self.transcript += reply + f"{GEMMA_END}\n"
+            self.last_truncated = (result.get("finish_reason") == "length")
 
     def visible_reply(self, raw_reply):
         """Post-process a completed reply for display (strip thinking and any
@@ -1340,14 +1360,24 @@ def _build_textual_app(cfg, llama_version, available):
                     self.app.call_from_thread(
                         bubble.update, f"(generation error: {e})")
                 finally:
-                    self.app.call_from_thread(self._finish_stream)
+                    truncated = getattr(self.controller, "last_truncated", False)
+                    self.app.call_from_thread(self._finish_stream, truncated)
 
             self.run_worker(work, thread=True, exclusive=True)
 
-        def _finish_stream(self) -> None:
+        def _finish_stream(self, truncated: bool = False) -> None:
             self._streaming = False
-            self._set_status("Ready. Enter to send \u00b7 Esc to switch buddy "
-                             "\u00b7 Ctrl+R to reset")
+            if truncated:
+                # The reply hit the max-tokens cap and was cut off mid-thought.
+                self._set_status(
+                    "\u26a0 Reply reached the length limit and was cut off. "
+                    "Send 'continue' to have the buddy carry on, or raise "
+                    "reply_max_tokens in config.yml.")
+            else:
+                self._set_status(
+                    "Ready. Enter to send \u00b7 Esc to switch buddy "
+                    "\u00b7 Ctrl+R to reset")
+            self.query_one("#composer", ChatInput).focus()
             self.query_one("#composer", ChatInput).focus()
 
     class LoadingScreen(Screen):

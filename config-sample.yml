@@ -69,3 +69,10 @@ tunables:
 
   # Never build a save-point smaller than this total context.
   min_n_ctx: 2048
+
+  # Maximum tokens the buddy may generate in a single reply (~750 words at
+  # 1024). If a reply reaches this limit it is cut off mid-thought and the chat
+  # window shows a warning; you can then send "continue" or raise this value.
+  # Keep it comfortably smaller than runway_tokens so a long reply doesn't
+  # exhaust the conversational runway in one turn.
+  reply_max_tokens: 1024
