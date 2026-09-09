@@ -551,6 +551,26 @@ def strip_control_tokens(text):
     return stripped.strip() if stripped is not text else text.strip()
 
 
+def copy_to_clipboard(text):
+    """Copy text to the system clipboard via pyperclip, for consistent
+    behaviour across macOS, Linux, and Windows. Returns (ok, message).
+
+    On a headless / off-grid Linux box, pyperclip needs a backend such as
+    xclip or xsel (X11) or wl-clipboard (Wayland). If none is available it
+    raises; we catch that and return a helpful message rather than crashing."""
+    try:
+        import pyperclip
+    except ImportError:
+        return False, ("pyperclip is not installed (pip install pyperclip)")
+    try:
+        pyperclip.copy(text)
+        return True, "Copied to clipboard"
+    except Exception as e:
+        # Most commonly PyperclipException: no copy/paste mechanism found.
+        return False, (f"Clipboard unavailable: {e}. On Linux install xclip, "
+                       f"xsel, or wl-clipboard.")
+
+
 # --------------------------------------------------------------------------- #
 # Low-level generation that CONTINUES the current KV cache
 # --------------------------------------------------------------------------- #
@@ -1073,7 +1093,7 @@ def _build_textual_app(cfg, llama_version, available):
     from textual.containers import (Center, Container, Horizontal, Middle,
                                     Vertical, VerticalScroll)
     from textual.screen import Screen
-    from textual.widgets import (Footer, Label, ListItem,
+    from textual.widgets import (Button, Footer, Label, ListItem,
                                  ListView, Static, TextArea)
 
     # ------- palette: warm companion (left) vs cool self (right) -------------
@@ -1103,24 +1123,18 @@ def _build_textual_app(cfg, llama_version, available):
     #chat-banner { height: 1; content-align: center middle; width: 1fr;
                    color: $primary; text-style: bold; }
 
-    /* Gap between the scrolled content and the scrollbar, about one scrollbar
-       width, via right padding on the scroll container plus a matching
-       scrollbar size. */
-    #log { height: 1fr; padding: 1 2; scrollbar-size-vertical: 1;
+    /* Gap between the scrolled content and the scrollbar. The scrollbar has a
+       normal width, and the extra right padding (4 vs 2 on the left) leaves a
+       channel roughly one scrollbar-width wide between the content and the
+       bar, so text never sits flush against the scrollbar. */
+    #log { height: 1fr; padding: 1 4 1 2; scrollbar-size-vertical: 1;
            scrollbar-gutter: stable; }
 
-    /* Rows span the full width; align-horizontal positions the bubble. The
-       stack cap is high (92%) so a longer message uses almost all of its side,
-       leaving only a slim central gutter. Short messages naturally stay small
-       (ordinary chat-bubble behaviour, not a valley). */
-    /* Each message is a full-width row; align-horizontal pushes the single
-       bubble child left (buddy) or right (user). The bubble's max-width is a
-       percentage of the row (which has a definite 1fr width), so the cap
-       actually resolves. */
-    .row-buddy { width: 1fr; height: auto; align-horizontal: left;
-                 padding: 0 1 0 0; }
-    .row-user  { width: 1fr; height: auto; align-horizontal: right;
-                 padding: 0 0 1 1; }
+    /* Each message is a full-width row; align-horizontal pushes the bubble (and
+       its copy button) left (buddy) or right (user). The bubble's max-width is
+       a percentage of the row, so the cap resolves against a definite width.
+       Row layout (align-vertical, padding) is defined just below with the copy
+       button styles. */
     .speaker-row { padding: 0 0 0 0; }
 
     /* Bubbles hug their content up to a max-width, then wrap. width: auto +
@@ -1137,6 +1151,17 @@ def _build_textual_app(cfg, llama_version, available):
     }
 
     .speaker { color: $text-muted; padding: 0 1; height: 1; }
+
+    /* Compact copy button beside each message bubble. Kept quiet so it doesn't
+       compete with the message; it aligns to the top of the bubble. */
+    .copy-btn { min-width: 6; width: auto; height: 1; margin: 1 1 0 1;
+                color: $text-muted; background: $surface; border: none; }
+    .copy-btn:hover { color: $text; background: $primary 25%; }
+    /* Rows lay bubble and button side by side, aligned to the top. */
+    .row-buddy { width: 1fr; height: auto; align-horizontal: left;
+                 align-vertical: top; padding: 0 1 0 0; }
+    .row-user  { width: 1fr; height: auto; align-horizontal: right;
+                 align-vertical: top; padding: 0 0 1 1; }
 
     /* composer (top) above the status line (bottom) in a bottom-docked
        wrapper. The status row sits beneath the composer so its bottom border
@@ -1220,6 +1245,15 @@ def _build_textual_app(cfg, llama_version, available):
                 event.stop()
                 self.post_message(self.Submitted(self.text))
 
+    class CopyButton(Button):
+        """A small copy control attached to a message. It carries the ORIGINAL
+        message text (payload) so copying yields the source text, not the
+        reflowed/wrapped version shown in the bubble."""
+
+        def __init__(self, payload: str = "", **kwargs):
+            super().__init__("copy", compact=True, classes="copy-btn", **kwargs)
+            self.payload = payload
+
     class ChatScreen(Screen):
         BINDINGS = [
             Binding("escape", "back", "Switch buddy"),
@@ -1272,26 +1306,38 @@ def _build_textual_app(cfg, llama_version, available):
 
         def _add_user_row(self, text: str) -> None:
             log = self.query_one("#log", VerticalScroll)
-            # Bubble sits directly in a full-width row; the row's align pushes it
-            # right and the bubble's max-width (a % of the row) caps it.
+            # Bubble plus a copy button carrying the ORIGINAL text. The row's
+            # align pushes them right; the bubble's max-width caps its width.
             bubble = self._make_bubble(text, "bubble-user")
-            row = Horizontal(bubble, classes="row-user")
+            copy_btn = CopyButton(payload=text)
+            row = Horizontal(bubble, copy_btn, classes="row-user")
             log.mount(row)
             log.scroll_end(animate=False)
 
-        def _add_buddy_row(self) -> Static:
-            """Create an empty buddy bubble to stream into; return the Static.
-            The speaker tag is its own left-aligned line above the bubble."""
+        def _add_buddy_row(self):
+            """Create an empty buddy bubble to stream into. Returns
+            (bubble, copy_button); the caller sets the button's payload to the
+            finished reply text once streaming completes. The speaker tag is its
+            own left-aligned line above the bubble."""
             log = self.query_one("#log", VerticalScroll)
             speaker_row = Horizontal(
                 Label(self.controller.buddy, classes="speaker"),
                 classes="row-buddy speaker-row")
             bubble = self._make_bubble("", "bubble-buddy")
-            row = Horizontal(bubble, classes="row-buddy")
+            copy_btn = CopyButton(payload="")
+            row = Horizontal(bubble, copy_btn, classes="row-buddy")
             log.mount(speaker_row)
             log.mount(row)
             log.scroll_end(animate=False)
-            return bubble
+            return bubble, copy_btn
+
+        def on_button_pressed(self, event) -> None:
+            # Only our copy buttons carry a payload.
+            btn = event.button
+            if not isinstance(btn, CopyButton):
+                return
+            ok, msg = copy_to_clipboard(btn.payload or "")
+            self._set_status(("\u2713 " if ok else "\u26a0 ") + msg)
 
         def on_chat_input_submitted(self, event) -> None:
             if self._streaming:
@@ -1306,10 +1352,10 @@ def _build_textual_app(cfg, llama_version, available):
             composer = self.query_one("#composer", ChatInput)
             composer.text = ""
             self._add_user_row(text)
-            bubble = self._add_buddy_row()
+            bubble, copy_btn = self._add_buddy_row()
             self._streaming = True
             self._set_status(f"{self.controller.buddy} is thinking\u2026")
-            self._run_generation(text, bubble)
+            self._run_generation(text, bubble, copy_btn)
 
         def action_back(self) -> None:
             if self._streaming:
@@ -1331,7 +1377,7 @@ def _build_textual_app(cfg, llama_version, available):
             self._set_status("Conversation reset to the save-point.")
 
         # -- streaming runs in a worker thread; UI updates via call_from_thread
-        def _run_generation(self, user_text: str, bubble) -> None:
+        def _run_generation(self, user_text: str, bubble, copy_btn) -> None:
             from textual.worker import get_current_worker
 
             def work():
@@ -1356,6 +1402,10 @@ def _build_textual_app(cfg, llama_version, available):
                     final = self.controller.visible_reply("".join(acc))
                     if final:
                         self.app.call_from_thread(bubble.update, final)
+                    # The copy button copies the ORIGINAL reply text.
+                    def set_payload():
+                        copy_btn.payload = final or "".join(acc)
+                    self.app.call_from_thread(set_payload)
                 except Exception as e:
                     self.app.call_from_thread(
                         bubble.update, f"(generation error: {e})")

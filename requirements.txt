@@ -13,6 +13,12 @@ PyYAML>=6.0
 # Pin one version across all laptops for consistent rendering.
 textual
 
+# Cross-platform clipboard for the chat "copy" buttons. On a headless / off-grid
+# Linux laptop, pyperclip needs a backend: install xclip or xsel (X11), or
+# wl-clipboard (Wayland). Without one, copy shows a helpful message instead of
+# copying.
+pyperclip
+
 # Optional but recommended: enables the most accurate physical-core and RAM
 # detection in `benchmark` and thread auto-detection. Without it, the tool
 # falls back to /proc parsing and os.cpu_count() heuristics.

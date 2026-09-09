@@ -65,9 +65,16 @@ Two thinking-mode variants can be built per buddy:
   easy to tell apart at a glance. The message box grows as your text wraps.
   Press Enter to send, Page Up / Page Down to scroll, Esc to go back and switch
   buddy, Ctrl+R to reset the conversation to the save-point, type /quit to
-  leave, and press q (on the launch screen) to quit. Opening a buddy shows a
-  console of load steps (validating, loading weights, restoring state) so any
-  slow step is visible.
+  leave, and press q (on the launch screen) to quit. Each message has a small
+  "copy" button that copies that message's original text (not the wrapped
+  version shown) to the clipboard. Opening a buddy shows a console of load
+  steps (validating, loading weights, restoring state) so any slow step is
+  visible.
+
+  Note: the copy button uses pyperclip, which on Linux needs a clipboard
+  backend — install xclip or xsel (X11) or wl-clipboard (Wayland). Without one,
+  the button shows a short message explaining what to install instead of
+  copying. Worth baking a backend into the off-grid provisioning image.
 
 ## Sizing notes
 
